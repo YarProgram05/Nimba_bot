@@ -1,0 +1,10 @@
+name: Empty Workflow
+
+on: [push]
+
+jobs:
+  empty:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Do nothing
+        run: echo "Checks disabled by design"
