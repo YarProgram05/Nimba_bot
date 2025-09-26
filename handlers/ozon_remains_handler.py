@@ -24,11 +24,7 @@ if utils_dir not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-# Состояния
-OZON_REMAINS_CABINET_CHOICE = 7
-OZON_REMAINS_FILES = 3
-OZON_REMAINS_REPORT_TYPE = 4
-
+from states import OZON_REMAINS_CABINET_CHOICE, OZON_REMAINS_REPORT_TYPE
 
 # ======================
 # Ozon API Класс
@@ -136,10 +132,10 @@ def chunk_list(lst, n):
 # ======================
 
 async def start_ozon_remains(update: Update, context: CallbackContext) -> int:
-    """Начало — выбор кабинета Ozon для остатков"""
+    """Начало — выбор кабинета Ozon"""
     keyboard = [
-        [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='remains_cabinet_1')],
-        [InlineKeyboardButton("🏬 Озон_2 Galioni", callback_data='remains_cabinet_2')]
+        [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='cabinet_1')],
+        [InlineKeyboardButton("🏬 Озон_2 Galioni", callback_data='cabinet_2')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 

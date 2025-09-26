@@ -1,9 +1,8 @@
 import os
-import sys
 import logging
 import warnings
 from telegram.warnings import PTBUserWarning
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,8 +20,21 @@ warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*per_messag
 # Загружаем переменные окружения
 load_dotenv()
 
+# Импортируем состояния
+from states import (
+    SELECTING_ACTION,
+    WB_REPORT_FILES,
+    WB_REMAINS_FILES,
+    OZON_REMAINS_CABINET_CHOICE,
+    OZON_REMAINS_REPORT_TYPE,
+    BARCODE_FILES,
+    CSV_FILES,
+    OZON_SALES_CABINET_CHOICE,
+    OZON_SALES_DATE_START,
+    OZON_SALES_DATE_END
+)
+
 # Импортируем обработчики
-# УДАЛЕНО: ozon_handler (не используется для API-выгрузки)
 from handlers.wb_handler import (
     start_wb_report,
     handle_wb_files,
@@ -31,16 +43,7 @@ from handlers.wb_handler import (
 from handlers.ozon_remains_handler import (
     start_ozon_remains,
     handle_report_type_choice,
-    handle_cabinet_choice as handle_ozon_remains_cabinet,
-    OZON_REMAINS_CABINET_CHOICE,
-    OZON_REMAINS_REPORT_TYPE
-)
-from handlers.ozon_sales_handler import (
-    start_ozon_sales,
-    handle_cabinet_choice as handle_ozon_sales_cabinet,
-    handle_date_input,
-    OZON_SALES_CABINET_CHOICE,
-    OZON_SALES_DATE_INPUT
+    handle_cabinet_choice
 )
 from handlers.wb_remains_handler import (
     start_wb_remains,
@@ -57,6 +60,12 @@ from handlers.csv_converter_handler import (
     handle_csv_files,
     generate_xlsx_files
 )
+from handlers.ozon_sales_handler import (
+    start_ozon_sales,
+    handle_sales_cabinet_choice,
+    handle_sales_date_start,
+    handle_sales_date_end
+)
 
 # Настройка логгирования
 logging.basicConfig(
@@ -64,19 +73,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# Состояния разговоров
-from handlers.states import (
-    SELECTING_ACTION,
-    WB_REPORT_FILES,
-    OZON_REMAINS_CABINET_CHOICE,
-    OZON_REMAINS_REPORT_TYPE,
-    OZON_SALES_CABINET_CHOICE,
-    OZON_SALES_DATE_INPUT,
-    WB_REMAINS_FILES,
-    BARCODE_FILES,
-    CSV_FILES
-)
 
 
 def get_main_menu():
@@ -113,9 +109,7 @@ def cleanup_user_data(context: CallbackContext):
 
 
 async def start(update: Update, context: CallbackContext) -> int:
-    """Команда /start — сброс и возврат в главное меню"""
     cleanup_user_data(context)
-
     welcome_text = (
         "🔄 Бот сброшен. Добро пожаловать!\n\n"
         "Я помогу вам:\n"
@@ -124,18 +118,12 @@ async def start(update: Update, context: CallbackContext) -> int:
         "🔄 Конвертировать CSV файлы в XLSX\n\n"
         "Выберите действие из меню ниже:"
     )
-
-    await update.message.reply_text(
-        welcome_text,
-        reply_markup=get_main_menu()
-    )
+    await update.message.reply_text(welcome_text, reply_markup=get_main_menu())
     return SELECTING_ACTION
 
 
 async def show_help(update: Update, context: CallbackContext) -> int:
-    """Показ помощи"""
     cleanup_user_data(context)
-
     help_text = (
         "📋 Список команд и функций:\n\n"
         "/start - Вернуться в главное меню (сброс всех операций)\n"
@@ -147,9 +135,7 @@ async def show_help(update: Update, context: CallbackContext) -> int:
 
 
 async def select_action(update: Update, context: CallbackContext) -> int:
-    """Обработка выбора действия через кнопки"""
     text = update.message.text
-
     if text == "Продажи Ozon":
         return await start_ozon_sales(update, context)
     elif text == "Продажи WB":
@@ -164,54 +150,32 @@ async def select_action(update: Update, context: CallbackContext) -> int:
         return await start_csv_conversion(update, context)
     elif text == "Помощь":
         return await show_help(update, context)
-
     return SELECTING_ACTION
 
 
-# ✅ ГЛОБАЛЬНЫЙ ОБРАБОТЧИК CALLBACK-КНОПОК
 async def global_callback_handler(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
 
-    data = query.data
-    print(f"🔍 Получен callback: {data}")  # Для отладки
-
-    if data == 'sales_cabinet_1':
-        context.user_data['ozon_cabinet_id'] = 1
-        await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ:")
-        return None
-
-    elif data == 'sales_cabinet_2':
-        context.user_data['ozon_cabinet_id'] = 2
-        await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ:")
-        return None
-
-    elif data == 'cabinet_1':
-        context.user_data['ozon_cabinet_id'] = 1
-        # Вызываем обработчик остатков напрямую
-        return await handle_ozon_remains_cabinet(update, context)
-
-    elif data == 'cabinet_2':
-        context.user_data['ozon_cabinet_id'] = 2
-        return await handle_ozon_remains_cabinet(update, context)
-
-    elif data in ['raw', 'template']:
-        return await handle_report_type_choice(update, context)
-
+    if query.data in ['raw', 'template']:
+        await handle_report_type_choice(update, context)
+    elif query.data in ['cabinet_1', 'cabinet_2']:
+        current_flow = context.user_data.get('current_flow', 'remains')
+        if current_flow == 'sales':
+            await handle_sales_cabinet_choice(update, context)
+        else:
+            await handle_cabinet_choice(update, context)
     else:
         await query.message.reply_text("Неизвестная команда")
-        return None
 
 
 def main() -> None:
-    # Получаем токен из .env
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
         raise ValueError("❌ BOT_TOKEN не задан в .env")
 
     application = Application.builder().token(bot_token).build()
 
-    # ConversationHandler
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
@@ -227,14 +191,14 @@ def main() -> None:
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_files),
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_wb_report),
             ],
-            OZON_REMAINS_REPORT_TYPE: [],
-            OZON_SALES_DATE_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_input)
-            ],
             WB_REMAINS_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_remains_files),
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_wb_remains_report),
             ],
+            OZON_REMAINS_CABINET_CHOICE: [
+                CallbackQueryHandler(global_callback_handler)
+            ],
+            OZON_REMAINS_REPORT_TYPE: [],
             BARCODE_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_barcode_files),
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_barcode_report),
@@ -243,6 +207,15 @@ def main() -> None:
                 MessageHandler(filters.Document.FileExtension("csv"), handle_csv_files),
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_xlsx_files),
             ],
+            OZON_SALES_CABINET_CHOICE: [
+                CallbackQueryHandler(global_callback_handler)
+            ],
+            OZON_SALES_DATE_START: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sales_date_start),
+            ],
+            OZON_SALES_DATE_END: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sales_date_end),
+            ],
         },
         fallbacks=[CommandHandler('start', start)],
         per_message=False,
@@ -250,17 +223,11 @@ def main() -> None:
         per_user=True
     )
 
-    # Глобальный обработчик для всех callback-запросов
-    application.add_handler(CallbackQueryHandler(global_callback_handler))
-
     application.add_handler(conv_handler)
-
-    # Отдельные команды вне разговора
+    application.add_handler(CallbackQueryHandler(global_callback_handler))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", show_help))
 
-
-    # Запуск бота
     logger.info("🚀 Бот запущен!")
     application.run_polling()
 
