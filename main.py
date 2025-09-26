@@ -2,7 +2,7 @@ import os
 import logging
 import warnings
 from telegram.warnings import PTBUserWarning
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,

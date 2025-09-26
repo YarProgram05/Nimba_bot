@@ -6,7 +6,6 @@ import logging
 import re
 from datetime import datetime, timezone
 import requests
-import pandas as pd
 from telegram import Update, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import CallbackContext, ConversationHandler
 from openpyxl import Workbook

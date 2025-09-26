@@ -2,10 +2,9 @@ import sys
 import os
 import pandas as pd
 import logging
-import json
 import time
 import requests
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import CallbackContext, ConversationHandler
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side
