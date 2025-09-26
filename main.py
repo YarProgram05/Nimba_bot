@@ -174,27 +174,33 @@ async def global_callback_handler(update: Update, context: CallbackContext):
     await query.answer()
 
     data = query.data
+    print(f"🔍 Получен callback: {data}")  # Для отладки
 
-    # Обработка продаж
-    if context.user_data.get('awaiting_sales_cabinet'):
-        if data == 'sales_cabinet_1':
-            context.user_data['ozon_cabinet_id'] = 1
-            context.user_data['awaiting_sales_cabinet'] = False
-            await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ (например, 01.08.2025):")
-            return OZON_SALES_DATE_INPUT
-        elif data == 'sales_cabinet_2':
-            context.user_data['ozon_cabinet_id'] = 2
-            context.user_data['awaiting_sales_cabinet'] = False
-            await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ (например, 01.08.2025):")
-            return OZON_SALES_DATE_INPUT
+    if data == 'sales_cabinet_1':
+        context.user_data['ozon_cabinet_id'] = 1
+        await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ:")
+        return None
 
-    # Обработка остатков
-    if data in ['raw', 'template']:
-        await handle_report_type_choice(update, context)
-    elif data in ['cabinet_1', 'cabinet_2']:
-        await handle_ozon_remains_cabinet(update, context)
+    elif data == 'sales_cabinet_2':
+        context.user_data['ozon_cabinet_id'] = 2
+        await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ:")
+        return None
 
-    return SELECTING_ACTION
+    elif data == 'cabinet_1':
+        context.user_data['ozon_cabinet_id'] = 1
+        # Вызываем обработчик остатков напрямую
+        return await handle_ozon_remains_cabinet(update, context)
+
+    elif data == 'cabinet_2':
+        context.user_data['ozon_cabinet_id'] = 2
+        return await handle_ozon_remains_cabinet(update, context)
+
+    elif data in ['raw', 'template']:
+        return await handle_report_type_choice(update, context)
+
+    else:
+        await query.message.reply_text("Неизвестная команда")
+        return None
 
 
 def main() -> None:
@@ -221,9 +227,6 @@ def main() -> None:
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_files),
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_wb_report),
             ],
-            OZON_REMAINS_CABINET_CHOICE: [
-                CallbackQueryHandler(global_callback_handler)
-            ],
             OZON_REMAINS_REPORT_TYPE: [],
             OZON_SALES_DATE_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_input)
@@ -247,11 +250,15 @@ def main() -> None:
         per_user=True
     )
 
+    # Глобальный обработчик для всех callback-запросов
+    application.add_handler(CallbackQueryHandler(global_callback_handler))
+
     application.add_handler(conv_handler)
 
     # Отдельные команды вне разговора
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", show_help))
+
 
     # Запуск бота
     logger.info("🚀 Бот запущен!")
