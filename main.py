@@ -180,6 +180,10 @@ def main() -> None:
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("help", show_help),
+            # Добавляем обработку текста из главного меню как entry point
+            MessageHandler(filters.Regex(
+                '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'),
+                select_action),
         ],
         states={
             SELECTING_ACTION: [
@@ -196,7 +200,7 @@ def main() -> None:
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_wb_remains_report),
             ],
             OZON_REMAINS_CABINET_CHOICE: [
-                CallbackQueryHandler(global_callback_handler)
+                CallbackQueryHandler(handle_cabinet_choice),
             ],
             OZON_REMAINS_REPORT_TYPE: [],
             BARCODE_FILES: [
@@ -208,7 +212,7 @@ def main() -> None:
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_xlsx_files),
             ],
             OZON_SALES_CABINET_CHOICE: [
-                CallbackQueryHandler(global_callback_handler)
+                CallbackQueryHandler(handle_sales_cabinet_choice),
             ],
             OZON_SALES_DATE_START: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sales_date_start),
@@ -224,9 +228,8 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(global_callback_handler))
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", show_help))
+    # УДАЛЯЕМ глобальный CallbackQueryHandler!
+    # application.add_handler(CallbackQueryHandler(global_callback_handler))  # ← УДАЛЕНО
 
     logger.info("🚀 Бот запущен!")
     application.run_polling()

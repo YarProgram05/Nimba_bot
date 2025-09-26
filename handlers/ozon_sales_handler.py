@@ -1,7 +1,5 @@
-# handlers/ozon_sales_handler.py
-
-import sys
 import os
+import sys
 import logging
 import re
 from datetime import datetime, timezone
@@ -24,8 +22,9 @@ if utils_dir not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-#Состояния
+# Состояния
 from states import OZON_SALES_CABINET_CHOICE, OZON_SALES_DATE_START, OZON_SALES_DATE_END
+
 
 class OzonAPI:
     def __init__(self, cabinet_id=1):
@@ -63,7 +62,7 @@ class OzonAPI:
                 "with": {"analytics_data": False, "financial_data": False}
             }
             response = requests.post(
-                "https://api-seller.ozon.ru/v2/posting/fbo/list",
+                "https://api-seller.ozon.ru/v2/posting/fbo/list",  # ← УБРАНЫ ПРОБЕЛЫ!
                 headers=self.headers,
                 json=payload
             )
@@ -89,7 +88,7 @@ class OzonAPI:
                 "page_size": 1000
             }
             response = requests.post(
-                "https://api-seller.ozon.ru/v3/finance/transaction/list",
+                "https://api-seller.ozon.ru/v3/finance/transaction/list",  # ← УБРАНЫ ПРОБЕЛЫ!
                 headers=self.headers,
                 json=payload
             )
@@ -115,8 +114,7 @@ def validate_date_format(text: str) -> bool:
 
 
 async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
-    """Начало — выбор кабинета Ozon для продаж"""
-    context.user_data['current_flow'] = 'sales'  # ← ЭТО ОБЯЗАТЕЛЬНО!
+    context.user_data['current_flow'] = 'sales'
 
     keyboard = [
         [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='cabinet_1')],
@@ -132,15 +130,20 @@ async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
 
 
 async def handle_sales_cabinet_choice(update: Update, context: CallbackContext) -> int:
-    """Обработка выбора кабинета для продаж"""
     query = update.callback_query
     await query.answer()
 
     cabinet_data = query.data
+    if cabinet_data not in ('cabinet_1', 'cabinet_2'):
+        await query.message.reply_text("❌ Неизвестный кабинет.")
+        return ConversationHandler.END
+
     cabinet_id = 1 if cabinet_data == 'cabinet_1' else 2
     context.user_data['ozon_sales_cabinet_id'] = cabinet_id
 
-    await query.message.edit_text(
+    # Редактируем сообщение и отправляем новое
+    await query.message.edit_reply_markup(reply_markup=None)
+    await query.message.reply_text(
         f"✅ Выбран кабинет: Озон {cabinet_id}\n\n"
         "📅 Введите дату начала периода в формате ДД.ММ.ГГГГ:"
     )
@@ -148,6 +151,9 @@ async def handle_sales_cabinet_choice(update: Update, context: CallbackContext) 
 
 
 async def handle_sales_date_start(update: Update, context: CallbackContext) -> int:
+    logger.info(
+        f"[OZON SALES] Получена дата начала: '{update.message.text}' от пользователя {update.effective_user.id}")
+
     text = update.message.text.strip()
     if not validate_date_format(text):
         await update.message.reply_text("❌ Неверный формат даты. Введите в формате ДД.ММ.ГГГГ:")
@@ -155,13 +161,16 @@ async def handle_sales_date_start(update: Update, context: CallbackContext) -> i
 
     try:
         start_dt = parse_date_input(text)
-        # Ограничение: не более 31 дня позже сегодня
-        from datetime import timedelta
-        if start_dt.date() > datetime.now().date():
+        today = datetime.now(timezone.utc).date()
+        if start_dt.date() > today:
             await update.message.reply_text("❌ Дата начала не может быть в будущем.")
             return OZON_SALES_DATE_START
-    except Exception as e:
+    except ValueError:
         await update.message.reply_text("❌ Некорректная дата. Введите в формате ДД.ММ.ГГГГ:")
+        return OZON_SALES_DATE_START
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при парсинге даты: {e}")
+        await update.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
         return OZON_SALES_DATE_START
 
     context.user_data['ozon_sales_start_date'] = text
