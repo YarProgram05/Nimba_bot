@@ -258,11 +258,9 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
 
 async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
     """Начало — выбор кабинета Ozon для продаж"""
-    # Устанавливаем состояние для корректной обработки callback
-    context.user_data['conversation_state'] = 'ozon_sales_cabinet'
     keyboard = [
-        [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='cabinet_1')],
-        [InlineKeyboardButton("🏬 Озон_2 Galioni", callback_data='cabinet_2')]
+        [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='sales_cabinet_1')],
+        [InlineKeyboardButton("🏬 Озон_2 Galioni", callback_data='sales_cabinet_2')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 

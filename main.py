@@ -173,18 +173,21 @@ async def global_callback_handler(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
 
-    if query.data in ['raw', 'template']:
-        await handle_report_type_choice(update, context)
-    elif query.data in ['cabinet_1', 'cabinet_2']:
-        # Определяем контекст по текущему состоянию
-        current_state = context.user_data.get('conversation_state')
+    data = query.data
 
-        # Для продаж Ozon
-        if current_state == 'ozon_sales_cabinet':
-            return await handle_ozon_sales_cabinet(update, context)
-        # Для остатков Ozon
-        else:
-            return await handle_ozon_remains_cabinet(update, context)
+    if data in ['raw', 'template']:
+        await handle_report_type_choice(update, context)
+    elif data in ['cabinet_1', 'cabinet_2']:
+        # Это для остатков - вызываем оригинальный обработчик с правильным именем
+        await handle_ozon_remains_cabinet(update, context)
+    elif data == 'sales_cabinet_1':
+        context.user_data['ozon_cabinet_id'] = 1
+        await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ (например, 01.08.2025):")
+        return OZON_SALES_DATE_INPUT
+    elif data == 'sales_cabinet_2':
+        context.user_data['ozon_cabinet_id'] = 2
+        await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ (например, 01.08.2025):")
+        return OZON_SALES_DATE_INPUT
     else:
         await query.message.reply_text("Неизвестная команда")
 

@@ -136,10 +136,10 @@ def chunk_list(lst, n):
 # ======================
 
 async def start_ozon_remains(update: Update, context: CallbackContext) -> int:
-    """Начало — выбор кабинета Ozon"""
+    """Начало — выбор кабинета Ozon для остатков"""
     keyboard = [
-        [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='cabinet_1')],
-        [InlineKeyboardButton("🏬 Озон_2 Galioni", callback_data='cabinet_2')]
+        [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='remains_cabinet_1')],
+        [InlineKeyboardButton("🏬 Озон_2 Galioni", callback_data='remains_cabinet_2')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
