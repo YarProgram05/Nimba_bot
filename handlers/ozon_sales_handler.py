@@ -9,6 +9,7 @@ from telegram.ext import CallbackContext, ConversationHandler
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from handlers.states import SELECTING_ACTION
 
 # Настройка путей
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -269,7 +270,9 @@ async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
         reply_markup=reply_markup
     )
 
-    return OZON_SALES_CABINET_CHOICE
+    # Возвращаем SELECTING_ACTION, но сохраняем контекст
+    context.user_data['awaiting_sales_cabinet'] = True
+    return SELECTING_ACTION
 
 
 async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int:

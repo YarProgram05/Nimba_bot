@@ -66,7 +66,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Состояния разговоров
-(
+from handlers.states import (
     SELECTING_ACTION,
     WB_REPORT_FILES,
     OZON_REMAINS_CABINET_CHOICE,
@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
     WB_REMAINS_FILES,
     BARCODE_FILES,
     CSV_FILES
-) = range(9)
+)
 
 
 def get_main_menu():
@@ -175,21 +175,26 @@ async def global_callback_handler(update: Update, context: CallbackContext):
 
     data = query.data
 
+    # Обработка продаж
+    if context.user_data.get('awaiting_sales_cabinet'):
+        if data == 'sales_cabinet_1':
+            context.user_data['ozon_cabinet_id'] = 1
+            context.user_data['awaiting_sales_cabinet'] = False
+            await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ (например, 01.08.2025):")
+            return OZON_SALES_DATE_INPUT
+        elif data == 'sales_cabinet_2':
+            context.user_data['ozon_cabinet_id'] = 2
+            context.user_data['awaiting_sales_cabinet'] = False
+            await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ (например, 01.08.2025):")
+            return OZON_SALES_DATE_INPUT
+
+    # Обработка остатков
     if data in ['raw', 'template']:
         await handle_report_type_choice(update, context)
     elif data in ['cabinet_1', 'cabinet_2']:
-        # Это для остатков - вызываем оригинальный обработчик с правильным именем
         await handle_ozon_remains_cabinet(update, context)
-    elif data == 'sales_cabinet_1':
-        context.user_data['ozon_cabinet_id'] = 1
-        await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ (например, 01.08.2025):")
-        return OZON_SALES_DATE_INPUT
-    elif data == 'sales_cabinet_2':
-        context.user_data['ozon_cabinet_id'] = 2
-        await query.message.edit_text("📅 Введите период выгрузки продаж в формате ДД.ММ.ГГГГ (например, 01.08.2025):")
-        return OZON_SALES_DATE_INPUT
-    else:
-        await query.message.reply_text("Неизвестная команда")
+
+    return SELECTING_ACTION
 
 
 def main() -> None:
@@ -220,9 +225,6 @@ def main() -> None:
                 CallbackQueryHandler(global_callback_handler)
             ],
             OZON_REMAINS_REPORT_TYPE: [],
-            OZON_SALES_CABINET_CHOICE: [
-                CallbackQueryHandler(global_callback_handler)
-            ],
             OZON_SALES_DATE_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_input)
             ],
