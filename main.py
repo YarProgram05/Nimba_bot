@@ -22,11 +22,7 @@ warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*per_messag
 load_dotenv()
 
 # Импортируем обработчики
-from handlers.ozon_handler import (
-    start_ozon_report,
-    handle_ozon_files,
-    generate_ozon_report
-)
+# УДАЛЕНО: ozon_handler (не используется для API-выгрузки)
 from handlers.wb_handler import (
     start_wb_report,
     handle_wb_files,
@@ -35,8 +31,16 @@ from handlers.wb_handler import (
 from handlers.ozon_remains_handler import (
     start_ozon_remains,
     handle_report_type_choice,
-    handle_cabinet_choice,           # ← добавлено
-    OZON_REMAINS_CABINET_CHOICE      # ← добавлено
+    handle_cabinet_choice as handle_ozon_remains_cabinet,
+    OZON_REMAINS_CABINET_CHOICE,
+    OZON_REMAINS_REPORT_TYPE
+)
+from handlers.ozon_sales_handler import (
+    start_ozon_sales,
+    handle_cabinet_choice as handle_ozon_sales_cabinet,
+    handle_date_input,
+    OZON_SALES_CABINET_CHOICE,
+    OZON_SALES_DATE_INPUT
 )
 from handlers.wb_remains_handler import (
     start_wb_remains,
@@ -64,13 +68,15 @@ logger = logging.getLogger(__name__)
 # Состояния разговоров
 (
     SELECTING_ACTION,
-    OZON_REPORT_FILES,
     WB_REPORT_FILES,
+    OZON_REMAINS_CABINET_CHOICE,
     OZON_REMAINS_REPORT_TYPE,
+    OZON_SALES_CABINET_CHOICE,
+    OZON_SALES_DATE_INPUT,
     WB_REMAINS_FILES,
     BARCODE_FILES,
     CSV_FILES
-) = range(7)
+) = range(9)
 
 
 def get_main_menu():
@@ -145,7 +151,7 @@ async def select_action(update: Update, context: CallbackContext) -> int:
     text = update.message.text
 
     if text == "Продажи Ozon":
-        return await start_ozon_report(update, context)
+        return await start_ozon_sales(update, context)
     elif text == "Продажи WB":
         return await start_wb_report(update, context)
     elif text == "Остатки товаров Ozon":
@@ -162,7 +168,7 @@ async def select_action(update: Update, context: CallbackContext) -> int:
     return SELECTING_ACTION
 
 
-# ✅ ГЛОБАЛЬНЫЙ ОБРАБОТЧИК CALLBACK-КНОПОК — ВЫНЕСЕН ИЗ main()!
+# ✅ ГЛОБАЛЬНЫЙ ОБРАБОТЧИК CALLBACK-КНОПОК
 async def global_callback_handler(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
@@ -170,7 +176,15 @@ async def global_callback_handler(update: Update, context: CallbackContext):
     if query.data in ['raw', 'template']:
         await handle_report_type_choice(update, context)
     elif query.data in ['cabinet_1', 'cabinet_2']:
-        await handle_cabinet_choice(update, context)
+        # Определяем контекст по текущему состоянию
+        current_state = context.user_data.get('conversation_state')
+
+        # Для продаж Ozon
+        if current_state == 'ozon_sales_cabinet':
+            return await handle_ozon_sales_cabinet(update, context)
+        # Для остатков Ozon
+        else:
+            return await handle_ozon_remains_cabinet(update, context)
     else:
         await query.message.reply_text("Неизвестная команда")
 
@@ -193,20 +207,22 @@ def main() -> None:
             SELECTING_ACTION: [
                 MessageHandler(filters.Regex(
                     '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'),
-                               select_action),
-            ],
-            OZON_REPORT_FILES: [
-                MessageHandler(filters.Document.FileExtension("xlsx"), handle_ozon_files),
-                MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_ozon_report),
+                    select_action),
             ],
             WB_REPORT_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_files),
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_wb_report),
             ],
-            OZON_REMAINS_CABINET_CHOICE: [  # ← новое состояние
+            OZON_REMAINS_CABINET_CHOICE: [
                 CallbackQueryHandler(global_callback_handler)
             ],
             OZON_REMAINS_REPORT_TYPE: [],
+            OZON_SALES_CABINET_CHOICE: [
+                CallbackQueryHandler(global_callback_handler)
+            ],
+            OZON_SALES_DATE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_input)
+            ],
             WB_REMAINS_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_remains_files),
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_wb_remains_report),
@@ -227,9 +243,6 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
-
-    # Добавляем глобальный обработчик callback-запросов
-    application.add_handler(CallbackQueryHandler(global_callback_handler))
 
     # Отдельные команды вне разговора
     application.add_handler(CommandHandler("start", start))
