@@ -202,7 +202,9 @@ def main() -> None:
             OZON_REMAINS_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_cabinet_choice),
             ],
-            OZON_REMAINS_REPORT_TYPE: [],
+            OZON_REMAINS_REPORT_TYPE: [
+                CallbackQueryHandler(handle_report_type_choice),
+            ],
             BARCODE_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_barcode_files),
                 MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_barcode_report),
