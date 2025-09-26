@@ -116,6 +116,8 @@ def validate_date_format(text: str) -> bool:
 
 async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
     """Начало — выбор кабинета Ozon для продаж"""
+    context.user_data['current_flow'] = 'sales'  # ← ЭТО ОБЯЗАТЕЛЬНО!
+
     keyboard = [
         [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='cabinet_1')],
         [InlineKeyboardButton("🏬 Озон_2 Galioni", callback_data='cabinet_2')]
