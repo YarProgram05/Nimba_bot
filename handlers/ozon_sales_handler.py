@@ -2,7 +2,8 @@ import os
 import sys
 import logging
 import re
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timezone, timedelta
 import requests
 from telegram import Update, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import CallbackContext, ConversationHandler
@@ -62,7 +63,7 @@ class OzonAPI:
                 "with": {"analytics_data": False, "financial_data": False}
             }
             response = requests.post(
-                "https://api-seller.ozon.ru/v2/posting/fbo/list",  # ← УБРАНЫ ПРОБЕЛЫ!
+                "https://api-seller.ozon.ru/v2/posting/fbo/list",
                 headers=self.headers,
                 json=payload
             )
@@ -88,7 +89,7 @@ class OzonAPI:
                 "page_size": 1000
             }
             response = requests.post(
-                "https://api-seller.ozon.ru/v3/finance/transaction/list",  # ← УБРАНЫ ПРОБЕЛЫ!
+                "https://api-seller.ozon.ru/v3/finance/transaction/list",
                 headers=self.headers,
                 json=payload
             )
@@ -111,6 +112,22 @@ def parse_date_input(date_str: str) -> datetime:
 
 def validate_date_format(text: str) -> bool:
     return bool(re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', text.strip()))
+
+
+def split_date_range(start_dt: datetime, end_dt: datetime, max_days: int = 28):
+    """
+    Разбивает диапазон [start_dt, end_dt] на поддиапазоны длиной не более max_days.
+    Используем 28 дней, чтобы гарантированно уложиться в лимит Ozon (30 дней).
+    """
+    chunks = []
+    current_start = start_dt
+
+    while current_start <= end_dt:
+        chunk_end = min(current_start + timedelta(days=max_days), end_dt)
+        chunks.append((current_start, chunk_end))
+        current_start = chunk_end + timedelta(days=1)
+
+    return chunks
 
 
 async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
@@ -141,7 +158,6 @@ async def handle_sales_cabinet_choice(update: Update, context: CallbackContext) 
     cabinet_id = 1 if cabinet_data == 'cabinet_1' else 2
     context.user_data['ozon_sales_cabinet_id'] = cabinet_id
 
-    # Редактируем сообщение и отправляем новое
     await query.message.edit_reply_markup(reply_markup=None)
     await query.message.reply_text(
         f"✅ Выбран кабинет: Озон {cabinet_id}\n\n"
@@ -193,11 +209,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
             await update.message.reply_text("❌ Дата окончания не может быть раньше начала.")
             return OZON_SALES_DATE_END
 
-        if (end_dt - start_dt).days > 31:
-            await update.message.reply_text("❌ Максимальный период — 31 день. Введите новую дату окончания:")
-            return OZON_SALES_DATE_END
-
-        if end_dt.date() > datetime.now().date():
+        if end_dt.date() > datetime.now(timezone.utc).date():
             await update.message.reply_text("❌ Дата окончания не может быть в будущем.")
             return OZON_SALES_DATE_END
 
@@ -206,31 +218,46 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         return OZON_SALES_DATE_END
 
     context.user_data['ozon_sales_end_date'] = text
+    await update.message.reply_text("⏳ Загружаю данные с Ozon API... Это может занять несколько минут.")
 
-    await update.message.reply_text("⏳ Загружаю данные с Ozon API... Это может занять 1–2 минуты.")
-
-    # Теперь запускаем обработку
     try:
         cabinet_id = context.user_data['ozon_sales_cabinet_id']
-        start_date_str = context.user_data['ozon_sales_start_date']
-        end_date_str = context.user_data['ozon_sales_end_date']
+        start_str = context.user_data['ozon_sales_start_date']
+        end_str = context.user_data['ozon_sales_end_date']
 
-        start_dt = parse_date_input(start_date_str)
-        end_dt = parse_date_input(end_date_str)
-
-        start_posting = start_dt.strftime("%Y-%m-%dT00:00:00Z")
-        end_posting = end_dt.strftime("%Y-%m-%dT23:59:59Z")
-        start_finance = start_dt.strftime("%Y-%m-%dT00:00:00.000Z")
-        end_finance = end_dt.strftime("%Y-%m-%dT23:59:59.999Z")
+        start_dt = parse_date_input(start_str)
+        end_dt = parse_date_input(end_str)
 
         ozon = OzonAPI(cabinet_id=cabinet_id)
 
-        # Получаем FBO-отправления
-        postings = ozon.get_fbo_postings(start_posting, end_posting)
+        # === Разбиваем диапазон на чанки (макс. 30 дней) ===
+        date_chunks = split_date_range(start_dt, end_dt, max_days=28)
+        logger.info(f"Разбивка диапазона на {len(date_chunks)} чанков")
 
+        # === Собираем FBO-отправления ===
+        all_postings = []
+        for i, (chunk_start, chunk_end) in enumerate(date_chunks, 1):
+            logger.info(f"Запрос FBO {i}/{len(date_chunks)}: {chunk_start.date()} – {chunk_end.date()}")
+            start_iso = chunk_start.strftime("%Y-%m-%dT00:00:00Z")
+            end_iso = chunk_end.strftime("%Y-%m-%dT23:59:59Z")
+            postings = ozon.get_fbo_postings(start_iso, end_iso)
+            all_postings.extend(postings)
+            await asyncio.sleep(0.5)
+
+        # === Собираем финансовые операции ===
+        all_operations = []
+        for i, (chunk_start, chunk_end) in enumerate(date_chunks, 1):
+            logger.info(f"Запрос финансов {i}/{len(date_chunks)}: {chunk_start.date()} – {chunk_end.date()}")
+            start_iso = chunk_start.strftime("%Y-%m-%dT00:00:00.000Z")
+            end_iso = chunk_end.strftime("%Y-%m-%dT23:59:59.999Z")
+            ops = ozon.get_financial_operations(start_iso, end_iso)
+            all_operations.extend(ops)
+            await asyncio.sleep(0.5)
+
+        # === Обработка FBO ===
         purchases = {}
         cancels = {}
-        for p in postings:
+        for p in all_postings:
             status = p.get("status")
             for prod in p.get("products", []):
                 offer_id = str(prod.get("offer_id", "")).strip().lower()
@@ -245,10 +272,8 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         total_purchases = sum(purchases.values())
         total_cancels = sum(cancels.values())
 
-        # Получаем финансовые операции
-        operations = ozon.get_financial_operations(start_finance, end_finance)
-
-        # Получаем SKU → offer_id
+        # === Обработка финансов ===
+        operations = all_operations
         skus = set()
         for op in operations:
             for item in op.get("items", []):
@@ -284,7 +309,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                         if sku is not None and offer_id:
                             sku_to_offer[str(sku)] = str(offer_id).strip().lower()
 
-        # Собираем доход
+        # === Собираем доход ===
         income = {}
         for op in operations:
             amount = op.get("amount", 0)
@@ -315,7 +340,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         total_income = sum(income.values())
 
-        # Загружаем шаблон
+        # === Загружаем шаблон ===
         import importlib.util
         spec = importlib.util.spec_from_file_location("template_loader", os.path.join(utils_dir, "template_loader.py"))
         template_loader = importlib.util.module_from_spec(spec)
@@ -323,7 +348,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         art_to_id, id_to_name, main_ids_ordered = template_loader.load_template("Шаблон_Ozon")
 
-        # Группируем
+        # === Группируем ===
         grouped = {}
         unmatched = {}
 
@@ -360,14 +385,15 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                     'income': income.get(art, 0)
                 }
 
-        # Создаём отчёт
+        # === Создаём отчёт ===
         report_path = f"Ozon_Sales_{start_dt.strftime('%d%m%Y')}-{end_dt.strftime('%d%m%Y')}.xlsx"
-        create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, report_path, total_purchases, total_cancels, total_income)
+        create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, report_path, total_purchases,
+                            total_cancels, total_income)
 
         await update.message.reply_document(
             document=open(report_path, 'rb'),
             caption=f"📊 Отчёт по продажам Ozon (кабинет {cabinet_id})\n"
-                    f"Период: {start_date_str} – {end_date_str}",
+                    f"Период: {start_str} – {end_str}",
             reply_markup=ReplyKeyboardRemove()
         )
 
@@ -384,7 +410,8 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
     return ConversationHandler.END
 
 
-def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path, total_purchases, total_cancels, total_income):
+def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path, total_purchases, total_cancels,
+                        total_income):
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Сводный"
