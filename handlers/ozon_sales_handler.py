@@ -114,18 +114,40 @@ def validate_date_format(text: str) -> bool:
     return bool(re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', text.strip()))
 
 
-def split_date_range(start_dt: datetime, end_dt: datetime, max_days: int = 28):
+from dateutil.relativedelta import relativedelta
+
+def split_by_calendar_months(start_dt: datetime, end_dt: datetime):
     """
-    Разбивает диапазон [start_dt, end_dt] на поддиапазоны длиной не более max_days.
-    Используем 28 дней, чтобы гарантированно уложиться в лимит Ozon (30 дней).
+    Разбивает диапазон на календарные месяцы.
+    Гарантирует, что каждый чанк — это часть одного календарного месяца.
+    Максимальная длина — 31 день (разрешено Ozon).
     """
     chunks = []
-    current_start = start_dt
+    current_date = start_dt.date()
+    end_date = end_dt.date()
 
-    while current_start <= end_dt:
-        chunk_end = min(current_start + timedelta(days=max_days), end_dt)
-        chunks.append((current_start, chunk_end))
-        current_start = chunk_end + timedelta(days=1)
+    while current_date <= end_date:
+        # Начало текущего календарного месяца
+        month_start = current_date.replace(day=1)
+        # Конец текущего календарного месяца
+        if month_start.month == 12:
+            next_month = month_start.replace(year=month_start.year + 1, month=1)
+        else:
+            next_month = month_start.replace(month=month_start.month + 1)
+        month_end = next_month - timedelta(days=1)
+
+        # Ограничиваем чанк: не раньше current_date, не позже end_date и не позже month_end
+        chunk_start = current_date
+        chunk_end = min(month_end, end_date)
+
+        # Добавляем как datetime в UTC
+        chunks.append((
+            datetime.combine(chunk_start, datetime.min.time()).replace(tzinfo=timezone.utc),
+            datetime.combine(chunk_end, datetime.max.time()).replace(tzinfo=timezone.utc)
+        ))
+
+        # Переходим к следующему дню после chunk_end
+        current_date = chunk_end + timedelta(days=1)
 
     return chunks
 
@@ -230,8 +252,8 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         ozon = OzonAPI(cabinet_id=cabinet_id)
 
-        # === Разбиваем диапазон на чанки (макс. 30 дней) ===
-        date_chunks = split_date_range(start_dt, end_dt, max_days=28)
+
+        date_chunks = split_by_calendar_months(start_dt, end_dt)
         logger.info(f"Разбивка диапазона на {len(date_chunks)} чанков")
 
         # === Собираем FBO-отправления ===
