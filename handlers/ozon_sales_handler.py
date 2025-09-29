@@ -116,38 +116,35 @@ def validate_date_format(text: str) -> bool:
 
 def split_by_calendar_months(start_dt: datetime, end_dt: datetime):
     """
-    Разбивает диапазон на календарные месяцы, но гарантирует,
-    что каждый чанк не превышает 30 дней (требование Ozon).
+    Разбивает диапазон на чанки по календарным месяцам, уважая точные даты начала и окончания.
+    Пример: 10.03.2025 – 26.06.2025 →
+        [10.03–31.03], [01.04–30.04], [01.05–31.05], [01.06–26.06]
     """
     chunks = []
-    current = start_dt.date()
+    current_start = start_dt.date()
     end_date = end_dt.date()
 
-    while current <= end_date:
-        # Находим первый день следующего месяца
-        if current.month == 12:
-            next_month = current.replace(year=current.year + 1, month=1, day=1)
+    while current_start <= end_date:
+        # Определяем конец текущего месяца
+        if current_start.month == 12:
+            next_month = current_start.replace(year=current_start.year + 1, month=1)
         else:
-            next_month = current.replace(month=current.month + 1, day=1)
-
-        # Последний день текущего месяца
+            next_month = current_start.replace(month=current_start.month + 1)
         month_end = next_month - timedelta(days=1)
 
-        # Ограничиваем до 30 дней
-        chunk_end_by_month = min(month_end, end_date)
-        max_allowed_end = current + timedelta(days=29)  # 30 дней включительно
-        chunk_end = min(chunk_end_by_month, max_allowed_end)
+        # Ограничиваем конец чанка: либо конец месяца, либо общий end_date
+        chunk_end = min(month_end, end_date)
 
-        # Добавляем чанк как datetime (в UTC)
+        # Добавляем чанк
         chunks.append((
-            datetime.combine(current, datetime.min.time()).replace(tzinfo=timezone.utc),
+            datetime.combine(current_start, datetime.min.time()).replace(tzinfo=timezone.utc),
             datetime.combine(chunk_end, datetime.max.time()).replace(tzinfo=timezone.utc)
         ))
 
-        current = chunk_end + timedelta(days=1)
+        # Переходим к началу следующего месяца
+        current_start = next_month
 
     return chunks
-
 
 async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
     context.user_data['current_flow'] = 'sales'
@@ -472,21 +469,21 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     headers2 = [
         "Наименование",
         "Выкупы, шт",
-        "Отмены, шт",
         "Валовая прибыль, руб",
+        "Процент выкупов",
         "Прибыль на 1 ед, руб",
-        "Заказы, шт",
-        "Процент выкупов"
+        "Заказы, шт",  # ← 6-й столбец
+        "Отмены, шт"  # ← 7-й столбец
     ]
     ws2.append(headers2)
     for cell in ws2[1]:
         cell.font = Font(bold=True)
 
-    # Цвета
-    red_fill = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")  # Красный
-    orange_fill = PatternFill(start_color="FFCC99", end_color="FFCC99", fill_type="solid")  # Оранжевый
+    # Цвета для процентов
+    red_fill = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
+    orange_fill = PatternFill(start_color="FFCC99", end_color="FFCC99", fill_type="solid")
 
-    row_index = 2  # первая строка данных
+    row_index = 2
 
     for group_id in main_ids_ordered:
         data = grouped.get(group_id, {})
@@ -503,15 +500,15 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         ws2.append([
             name,
             purchases,
-            cancels,
             income_val,
+            f"{purchase_percent_val:.2f}%",
             profit_per_unit,
-            orders,
-            f"{purchase_percent_val:.2f}%"
+            orders,  # ← заказы
+            cancels  # ← отмены
         ])
 
-        # Применяем цвет к ячейке с процентом (столбец G)
-        percent_cell = ws2.cell(row=row_index, column=7)
+        # Цвет для ячейки "Процент выкупов" (столбец D = 4)
+        percent_cell = ws2.cell(row=row_index, column=4)
         if purchase_percent_val <= 50:
             percent_cell.fill = red_fill
         elif 50 < purchase_percent_val <= 60:
@@ -549,14 +546,14 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         ws2.append([
             name,
             purchases,
-            cancels,
             income_val,
+            f"{purchase_percent_val:.2f}%",
             profit_per_unit,
-            orders,
-            f"{purchase_percent_val:.2f}%"
+            orders,  # ← заказы
+            cancels  # ← отмены
         ])
 
-        percent_cell = ws2.cell(row=row_index, column=7)
+        percent_cell = ws2.cell(row=row_index, column=4)
         if purchase_percent_val <= 50:
             percent_cell.fill = red_fill
         elif 50 < purchase_percent_val <= 60:
@@ -569,16 +566,15 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         ws2.append([
             name,
             0,
-            0,
             income_val,
+            "—",
             0,
             0,
-            "—"
+            0
         ])
-        # Для "—" цвет не ставим
         row_index += 1
 
-    # Форматирование (границы, выравнивание)
+    # Форматирование
     thin_border = Border(
         left=Side(style='thin'),
         right=Side(style='thin'),
