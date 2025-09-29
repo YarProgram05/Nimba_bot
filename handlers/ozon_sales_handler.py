@@ -114,40 +114,37 @@ def validate_date_format(text: str) -> bool:
     return bool(re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', text.strip()))
 
 
-from dateutil.relativedelta import relativedelta
-
 def split_by_calendar_months(start_dt: datetime, end_dt: datetime):
     """
-    Разбивает диапазон на календарные месяцы.
-    Гарантирует, что каждый чанк — это часть одного календарного месяца.
-    Максимальная длина — 31 день (разрешено Ozon).
+    Разбивает диапазон на календарные месяцы, но гарантирует,
+    что каждый чанк не превышает 30 дней (требование Ozon).
     """
     chunks = []
-    current_date = start_dt.date()
+    current = start_dt.date()
     end_date = end_dt.date()
 
-    while current_date <= end_date:
-        # Начало текущего календарного месяца
-        month_start = current_date.replace(day=1)
-        # Конец текущего календарного месяца
-        if month_start.month == 12:
-            next_month = month_start.replace(year=month_start.year + 1, month=1)
+    while current <= end_date:
+        # Находим первый день следующего месяца
+        if current.month == 12:
+            next_month = current.replace(year=current.year + 1, month=1, day=1)
         else:
-            next_month = month_start.replace(month=month_start.month + 1)
+            next_month = current.replace(month=current.month + 1, day=1)
+
+        # Последний день текущего месяца
         month_end = next_month - timedelta(days=1)
 
-        # Ограничиваем чанк: не раньше current_date, не позже end_date и не позже month_end
-        chunk_start = current_date
-        chunk_end = min(month_end, end_date)
+        # Ограничиваем до 30 дней
+        chunk_end_by_month = min(month_end, end_date)
+        max_allowed_end = current + timedelta(days=29)  # 30 дней включительно
+        chunk_end = min(chunk_end_by_month, max_allowed_end)
 
-        # Добавляем как datetime в UTC
+        # Добавляем чанк как datetime (в UTC)
         chunks.append((
-            datetime.combine(chunk_start, datetime.min.time()).replace(tzinfo=timezone.utc),
+            datetime.combine(current, datetime.min.time()).replace(tzinfo=timezone.utc),
             datetime.combine(chunk_end, datetime.max.time()).replace(tzinfo=timezone.utc)
         ))
 
-        # Переходим к следующему дню после chunk_end
-        current_date = chunk_end + timedelta(days=1)
+        current = chunk_end + timedelta(days=1)
 
     return chunks
 
@@ -252,7 +249,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         ozon = OzonAPI(cabinet_id=cabinet_id)
 
-
+        # === Разбиваем диапазон на календарные месяцы (≤30 дней) ===
         date_chunks = split_by_calendar_months(start_dt, end_dt)
         logger.info(f"Разбивка диапазона на {len(date_chunks)} чанков")
 
@@ -276,23 +273,34 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
             all_operations.extend(ops)
             await asyncio.sleep(0.5)
 
-        # === Обработка FBO ===
-        purchases = {}
-        cancels = {}
+        # === Обработка FBO: собираем данные по артикулам ===
+        art_data = {}  # offer_id -> {orders: set, purchases: int, cancels: int}
+
         for p in all_postings:
+            posting_number = p.get("posting_number")
             status = p.get("status")
             for prod in p.get("products", []):
                 offer_id = str(prod.get("offer_id", "")).strip().lower()
                 if not offer_id:
                     continue
                 qty = prod.get("quantity", 0)
-                if status == "delivered":
-                    purchases[offer_id] = purchases.get(offer_id, 0) + qty
-                elif status == "cancelled":
-                    cancels[offer_id] = cancels.get(offer_id, 0) + qty
 
-        total_purchases = sum(purchases.values())
-        total_cancels = sum(cancels.values())
+                if offer_id not in art_data:
+                    art_data[offer_id] = {"orders": set(), "purchases": 0, "cancels": 0}
+
+                art_data[offer_id]["orders"].add(posting_number)
+                if status == "delivered":
+                    art_data[offer_id]["purchases"] += qty
+                elif status == "cancelled":
+                    art_data[offer_id]["cancels"] += qty
+
+        # Преобразуем orders в количество
+        for art in art_data:
+            art_data[art]["orders"] = len(art_data[art]["orders"])
+
+        total_purchases = sum(data["purchases"] for data in art_data.values())
+        total_cancels = sum(data["cancels"] for data in art_data.values())
+        total_orders = sum(data["orders"] for data in art_data.values())
 
         # === Обработка финансов ===
         operations = all_operations
@@ -331,7 +339,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                         if sku is not None and offer_id:
                             sku_to_offer[str(sku)] = str(offer_id).strip().lower()
 
-        # === Собираем доход ===
+        # === Собираем доход по артикулам ===
         income = {}
         for op in operations:
             amount = op.get("amount", 0)
@@ -370,47 +378,50 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         art_to_id, id_to_name, main_ids_ordered = template_loader.load_template("Шаблон_Ozon")
 
-        # === Группируем ===
+        # === Группируем данные ===
         grouped = {}
-        unmatched = {}
-
         for group_id in main_ids_ordered:
             grouped[group_id] = {
                 'name': id_to_name.get(group_id, f"Группа {group_id}"),
+                'orders': 0,
                 'purchases': 0,
                 'cancels': 0,
                 'income': 0
             }
 
-        all_arts = set(purchases.keys()) | set(cancels.keys()) | set(income.keys())
+        unmatched = {}
+        all_arts = set(art_data.keys()) | set(income.keys())
 
         for art in all_arts:
             if art.lower().startswith("тип_начисления:"):
                 unmatched[art] = {
                     'name': art,
-                    'purchases': purchases.get(art, 0),
-                    'cancels': cancels.get(art, 0),
+                    'orders': art_data.get(art, {}).get('orders', 0),
+                    'purchases': art_data.get(art, {}).get('purchases', 0),
+                    'cancels': art_data.get(art, {}).get('cancels', 0),
                     'income': income.get(art, 0)
                 }
                 continue
 
             group_id = art_to_id.get(art)
             if group_id is not None:
-                grouped[group_id]['purchases'] += purchases.get(art, 0)
-                grouped[group_id]['cancels'] += cancels.get(art, 0)
+                grouped[group_id]['orders'] += art_data.get(art, {}).get('orders', 0)
+                grouped[group_id]['purchases'] += art_data.get(art, {}).get('purchases', 0)
+                grouped[group_id]['cancels'] += art_data.get(art, {}).get('cancels', 0)
                 grouped[group_id]['income'] += income.get(art, 0)
             else:
                 unmatched[art] = {
                     'name': f"НЕОПОЗНАННЫЙ_АРТИКУЛ: {art}",
-                    'purchases': purchases.get(art, 0),
-                    'cancels': cancels.get(art, 0),
+                    'orders': art_data.get(art, {}).get('orders', 0),
+                    'purchases': art_data.get(art, {}).get('purchases', 0),
+                    'cancels': art_data.get(art, {}).get('cancels', 0),
                     'income': income.get(art, 0)
                 }
 
         # === Создаём отчёт ===
         report_path = f"Ozon_Sales_{start_dt.strftime('%d%m%Y')}-{end_dt.strftime('%d%m%Y')}.xlsx"
-        create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, report_path, total_purchases,
-                            total_cancels, total_income)
+        create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, report_path, total_orders,
+                            total_purchases, total_cancels, total_income)
 
         await update.message.reply_document(
             document=open(report_path, 'rb'),
@@ -432,8 +443,10 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
     return ConversationHandler.END
 
 
-def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path, total_purchases, total_cancels,
-                        total_income):
+def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path, total_orders, total_purchases,
+                        total_cancels, total_income):
+    from openpyxl.styles import PatternFill
+
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Сводный"
@@ -443,9 +456,10 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     for cell in ws1[1]:
         cell.font = Font(bold=True)
 
+    ws1.append(["Заказы, шт", total_orders])
     ws1.append(["Выкупы, шт", total_purchases])
     ws1.append(["Отмены, шт", total_cancels])
-    ws1.append(["Валовая маржа, руб", total_income])
+    ws1.append(["Валовая прибыль, руб", total_income])
 
     avg_profit_per_unit = total_income / total_purchases if total_purchases > 0 else 0
     ws1.append(["Прибыль на 1 ед, руб", avg_profit_per_unit])
@@ -455,19 +469,57 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     ws1.append(["Процент выкупов", f"{purchase_percent:.2f}%"])
 
     ws2 = wb.create_sheet(title="Подробный")
-    headers2 = ["Наименование", "Выкупы, шт", "Валовая маржа, руб", "Прибыль на 1 ед, руб", "Отмены, шт"]
+    headers2 = [
+        "Наименование",
+        "Выкупы, шт",
+        "Отмены, шт",
+        "Валовая прибыль, руб",
+        "Прибыль на 1 ед, руб",
+        "Заказы, шт",
+        "Процент выкупов"
+    ]
     ws2.append(headers2)
     for cell in ws2[1]:
         cell.font = Font(bold=True)
 
-    for group_id in main_ids_ordered:
-        name = id_to_name.get(group_id, f"Группа {group_id}")
-        purchases = grouped.get(group_id, {}).get('purchases', 0)
-        cancels = grouped.get(group_id, {}).get('cancels', 0)
-        income_val = grouped.get(group_id, {}).get('income', 0)
-        profit_per_unit = income_val / purchases if purchases > 0 else 0
-        ws2.append([name, purchases, income_val, profit_per_unit, cancels])
+    # Цвета
+    red_fill = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")  # Красный
+    orange_fill = PatternFill(start_color="FFCC99", end_color="FFCC99", fill_type="solid")  # Оранжевый
 
+    row_index = 2  # первая строка данных
+
+    for group_id in main_ids_ordered:
+        data = grouped.get(group_id, {})
+        name = data.get('name', f"Группа {group_id}")
+        orders = data.get('orders', 0)
+        purchases = data.get('purchases', 0)
+        cancels = data.get('cancels', 0)
+        income_val = data.get('income', 0)
+
+        profit_per_unit = income_val / purchases if purchases > 0 else 0
+        total_shipments = purchases + cancels
+        purchase_percent_val = (purchases / total_shipments * 100) if total_shipments > 0 else 0
+
+        ws2.append([
+            name,
+            purchases,
+            cancels,
+            income_val,
+            profit_per_unit,
+            orders,
+            f"{purchase_percent_val:.2f}%"
+        ])
+
+        # Применяем цвет к ячейке с процентом (столбец G)
+        percent_cell = ws2.cell(row=row_index, column=7)
+        if purchase_percent_val <= 50:
+            percent_cell.fill = red_fill
+        elif 50 < purchase_percent_val <= 60:
+            percent_cell.fill = orange_fill
+
+        row_index += 1
+
+    # Неопознанные артикулы
     unknown_articles = []
     service_types = []
 
@@ -486,16 +538,47 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     service_types.sort(key=lambda x: x[0])
 
     for name, data in unknown_articles:
-        purchases = data['purchases']
-        cancels = data['cancels']
-        income_val = data['income']
+        orders = data.get('orders', 0)
+        purchases = data.get('purchases', 0)
+        cancels = data.get('cancels', 0)
+        income_val = data.get('income', 0)
         profit_per_unit = income_val / purchases if purchases > 0 else 0
-        ws2.append([name, purchases, income_val, profit_per_unit, cancels])
+        total_shipments = purchases + cancels
+        purchase_percent_val = (purchases / total_shipments * 100) if total_shipments > 0 else 0
+
+        ws2.append([
+            name,
+            purchases,
+            cancels,
+            income_val,
+            profit_per_unit,
+            orders,
+            f"{purchase_percent_val:.2f}%"
+        ])
+
+        percent_cell = ws2.cell(row=row_index, column=7)
+        if purchase_percent_val <= 50:
+            percent_cell.fill = red_fill
+        elif 50 < purchase_percent_val <= 60:
+            percent_cell.fill = orange_fill
+
+        row_index += 1
 
     for name, data in service_types:
-        income_val = data['income']
-        ws2.append([name, 0, income_val, 0, 0])
+        income_val = data.get('income', 0)
+        ws2.append([
+            name,
+            0,
+            0,
+            income_val,
+            0,
+            0,
+            "—"
+        ])
+        # Для "—" цвет не ставим
+        row_index += 1
 
+    # Форматирование (границы, выравнивание)
     thin_border = Border(
         left=Side(style='thin'),
         right=Side(style='thin'),
