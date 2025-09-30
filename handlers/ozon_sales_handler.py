@@ -420,10 +420,40 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, report_path, total_orders,
                             total_purchases, total_cancels, total_income)
 
+        # === Формируем текстовое сообщение ===
+        total_shipments = total_purchases + total_cancels
+        purchase_percent = (total_purchases / total_shipments * 100) if total_shipments > 0 else 0
+        avg_profit_per_unit = total_income / total_purchases if total_purchases > 0 else 0
+
+        # Форматируем числа
+        def fmt_num(x):
+            if isinstance(x, float):
+                return f"{x:,.2f}".replace(",", " ")
+            return f"{x:,}".replace(",", " ")
+
+        text_summary = (
+            f"📊 <b>Сводка по продажам Ozon</b>\n"
+            f"Кабинет: <b>Озон {cabinet_id}</b>\n"
+            f"Период: <b>{start_str} – {end_str}</b>\n\n"
+
+            f"📦 <b>Заказы:</b> {fmt_num(total_orders)} шт\n"
+            f"✅ <b>Выкупы:</b> {fmt_num(total_purchases)} шт\n"
+            f"❌ <b>Отмены:</b> {fmt_num(total_cancels)} шт\n"
+            f"💰 <b>Валовая прибыль:</b> {fmt_num(total_income)} ₽\n"
+            f"📈 <b>Прибыль на 1 ед:</b> {fmt_num(avg_profit_per_unit)} ₽\n"
+            f"🔄 <b>Процент выкупов:</b> {purchase_percent:.2f}%"
+        )
+
+        # Отправляем Excel-файл
         await update.message.reply_document(
             document=open(report_path, 'rb'),
-            caption=f"📊 Отчёт по продажам Ozon (кабинет {cabinet_id})\n"
-                    f"Период: {start_str} – {end_str}",
+            caption=f"📊 Подробный отчёт в Excel по продажам Ozon (кабинет {cabinet_id})\nПериод: {start_str} – {end_str}"
+        )
+
+        # Отправляем текстовое сообщение
+        await update.message.reply_text(
+            text_summary,
+            parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove()
         )
 
