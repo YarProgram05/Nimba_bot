@@ -1,14 +1,14 @@
 import os
 import sys
 import logging
-import re
 import asyncio
 from datetime import datetime, timezone, timedelta
 import requests
+import time
 from telegram import Update, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import CallbackContext, ConversationHandler
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, Border, Side
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 
 # Настройка путей
@@ -25,6 +25,21 @@ logger = logging.getLogger(__name__)
 
 # Состояния
 from states import OZON_SALES_CABINET_CHOICE, OZON_SALES_DATE_START, OZON_SALES_DATE_END
+
+
+def split_by_max_period(start: datetime, end: datetime, max_days: int):
+    """Разбивает диапазон на чанки не длиннее max_days дней."""
+    chunks = []
+    current = start.date()
+    end_date = end.date()
+    while current <= end_date:
+        chunk_end = min(current + timedelta(days=max_days - 1), end_date)
+        chunks.append((
+            datetime.combine(current, datetime.min.time()).replace(tzinfo=timezone.utc),
+            datetime.combine(chunk_end, datetime.max.time()).replace(tzinfo=timezone.utc)
+        ))
+        current = chunk_end + timedelta(days=1)
+    return chunks
 
 
 class OzonAPI:
@@ -50,6 +65,26 @@ class OzonAPI:
             "Content-Type": "application/json"
         }
 
+    def _post_with_retry(self, url: str, payload: dict, max_retries: int = 3):
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, json=payload, headers=self.headers, timeout=30)
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code in (502, 503, 504):
+                    logger.warning(f"⚠️ Ozon API error {response.status_code} on {url}, attempt {attempt + 1}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                else:
+                    raise Exception(f"API error {response.status_code}: {response.text}")
+            except requests.exceptions.Timeout:
+                logger.warning(f"⚠️ Timeout on {url}, attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+        raise Exception(f"Failed to call {url} after {max_retries} attempts")
+
     def get_fbo_postings(self, since: str, to: str):
         all_postings = []
         offset = 0
@@ -62,14 +97,7 @@ class OzonAPI:
                 "offset": offset,
                 "with": {"analytics_data": False, "financial_data": False}
             }
-            response = requests.post(
-                "https://api-seller.ozon.ru/v2/posting/fbo/list",
-                headers=self.headers,
-                json=payload
-            )
-            if response.status_code != 200:
-                raise Exception(f"FBO error {response.status_code}: {response.text}")
-            data = response.json()
+            data = self._post_with_retry("https://api-seller.ozon.ru/v2/posting/fbo/list", payload)
             postings = data.get("result", [])
             if not postings:
                 break
@@ -88,14 +116,7 @@ class OzonAPI:
                 "page": page,
                 "page_size": 1000
             }
-            response = requests.post(
-                "https://api-seller.ozon.ru/v3/finance/transaction/list",
-                headers=self.headers,
-                json=payload
-            )
-            if response.status_code != 200:
-                raise Exception(f"Finance error {response.status_code}: {response.text}")
-            data = response.json()
+            data = self._post_with_retry("https://api-seller.ozon.ru/v3/finance/transaction/list", payload)
             ops = data.get("result", {}).get("operations", [])
             if not ops:
                 break
@@ -111,12 +132,12 @@ def parse_date_input(date_str: str) -> datetime:
 
 
 def validate_date_format(text: str) -> bool:
+    import re
     return bool(re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', text.strip()))
-
 
 def split_by_calendar_months(start_dt: datetime, end_dt: datetime):
     """
-    Разбивает диапазон на чанки по календарным месяцам, уважая точные даты начала и окончания.
+    Разбивает диапазон на чанки по календарным месяцам.
     Пример: 10.03.2025 – 26.06.2025 →
         [10.03–31.03], [01.04–30.04], [01.05–31.05], [01.06–26.06]
     """
@@ -125,23 +146,17 @@ def split_by_calendar_months(start_dt: datetime, end_dt: datetime):
     end_date = end_dt.date()
 
     while current_start <= end_date:
-        # Определяем конец текущего месяца
         if current_start.month == 12:
             next_month = current_start.replace(year=current_start.year + 1, month=1)
         else:
             next_month = current_start.replace(month=current_start.month + 1)
         month_end = next_month - timedelta(days=1)
-
-        # Ограничиваем конец чанка: либо конец месяца, либо общий end_date
         chunk_end = min(month_end, end_date)
 
-        # Добавляем чанк
         chunks.append((
             datetime.combine(current_start, datetime.min.time()).replace(tzinfo=timezone.utc),
             datetime.combine(chunk_end, datetime.max.time()).replace(tzinfo=timezone.utc)
         ))
-
-        # Переходим к началу следующего месяца
         current_start = next_month
 
     return chunks
@@ -236,6 +251,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
     context.user_data['ozon_sales_end_date'] = text
     await update.message.reply_text("⏳ Загружаю данные с Ozon API... Это может занять несколько минут.")
 
+    start_time = time.time()
     try:
         cabinet_id = context.user_data['ozon_sales_cabinet_id']
         start_str = context.user_data['ozon_sales_start_date']
@@ -246,35 +262,33 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         ozon = OzonAPI(cabinet_id=cabinet_id)
 
-        # === Разбиваем диапазон на календарные месяцы (≤30 дней) ===
-        date_chunks = split_by_calendar_months(start_dt, end_dt)
-        logger.info(f"Разбивка диапазона на {len(date_chunks)} чанков")
-
-        # === Собираем FBO-отправления ===
+        # === FBO: до 365 дней ===
+        fbo_chunks = split_by_max_period(start_dt, end_dt, max_days=365)
         all_postings = []
-        for i, (chunk_start, chunk_end) in enumerate(date_chunks, 1):
-            logger.info(f"Запрос FBO {i}/{len(date_chunks)}: {chunk_start.date()} – {chunk_end.date()}")
+        for i, (chunk_start, chunk_end) in enumerate(fbo_chunks, 1):
+            logger.info(f"Запрос FBO {i}/{len(fbo_chunks)}: {chunk_start.date()} – {chunk_end.date()}")
             start_iso = chunk_start.strftime("%Y-%m-%dT00:00:00Z")
             end_iso = chunk_end.strftime("%Y-%m-%dT23:59:59Z")
             postings = ozon.get_fbo_postings(start_iso, end_iso)
             all_postings.extend(postings)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
 
-        # === Собираем финансовые операции ===
+        # === Финансы: по календарным месяцам (как раньше) ===
+        finance_chunks = split_by_calendar_months(start_dt, end_dt)
         all_operations = []
-        for i, (chunk_start, chunk_end) in enumerate(date_chunks, 1):
-            logger.info(f"Запрос финансов {i}/{len(date_chunks)}: {chunk_start.date()} – {chunk_end.date()}")
+        for i, (chunk_start, chunk_end) in enumerate(finance_chunks, 1):
+            logger.info(f"Запрос финансов {i}/{len(finance_chunks)}: {chunk_start.date()} – {chunk_end.date()}")
             start_iso = chunk_start.strftime("%Y-%m-%dT00:00:00.000Z")
             end_iso = chunk_end.strftime("%Y-%m-%dT23:59:59.999Z")
 
-            # Retry-логика для устойчивости к 504 ошибкам
+            # Retry-логика (оставляем для надёжности)
             ops = None
             for attempt in range(3):
                 try:
                     ops = ozon.get_financial_operations(start_iso, end_iso)
                     break
                 except Exception as e:
-                    if "504" in str(e) or "502" in str(e) or "timeout" in str(e).lower():
+                    if any(code in str(e) for code in ["504", "502", "timeout"]):
                         logger.warning(f"⚠️ Финансы: попытка {attempt + 1}/3 провалена для {chunk_start.date()}")
                         if attempt < 2:
                             await asyncio.sleep(2 ** attempt)
@@ -282,11 +296,12 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                     raise
 
             all_operations.extend(ops)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
 
-        # === Обработка FBO: собираем данные по артикулам ===
-        art_data = {}  # offer_id -> {orders: set, purchases: int, cancels: int}
+        logger.info(f"Данные загружены за {time.time() - start_time:.1f} сек")
 
+        # === Обработка FBO ===
+        art_data = {}
         for p in all_postings:
             posting_number = p.get("posting_number")
             status = p.get("status")
@@ -305,7 +320,6 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                 elif status == "cancelled":
                     art_data[offer_id]["cancels"] += qty
 
-        # Преобразуем orders в количество
         for art in art_data:
             art_data[art]["orders"] = len(art_data[art]["orders"])
 
@@ -334,13 +348,13 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                 except (ValueError, TypeError, OverflowError):
                     continue
 
-            chunks = [valid_skus[i:i + 1000] for i in range(0, len(valid_skus), 1000)]
-            for chunk in chunks:
+            for chunk in [valid_skus[i:i + 1000] for i in range(0, len(valid_skus), 1000)]:
                 payload = {"sku": chunk}
                 response = requests.post(
                     "https://api-seller.ozon.ru/v3/product/info/list",
                     headers=ozon.headers,
-                    json=payload
+                    json=payload,
+                    timeout=30
                 )
                 if response.status_code == 200:
                     items = response.json().get("items", [])
@@ -350,7 +364,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                         if sku is not None and offer_id:
                             sku_to_offer[str(sku)] = str(offer_id).strip().lower()
 
-        # === Собираем доход по артикулам ===
+        # === Доход по артикулам ===
         income = {}
         for op in operations:
             amount = op.get("amount", 0)
@@ -381,7 +395,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         total_income = sum(income.values())
 
-        # === Загружаем шаблон ===
+        # === Загрузка шаблона ===
         import importlib.util
         spec = importlib.util.spec_from_file_location("template_loader", os.path.join(utils_dir, "template_loader.py"))
         template_loader = importlib.util.module_from_spec(spec)
@@ -389,7 +403,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         art_to_id, id_to_name, main_ids_ordered = template_loader.load_template("Шаблон_Ozon")
 
-        # === Группируем данные ===
+        # === Группировка по шаблону ===
         grouped = {}
         for group_id in main_ids_ordered:
             grouped[group_id] = {
@@ -429,13 +443,11 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                     'income': income.get(art, 0)
                 }
 
-        # === Создаём отчёт ===
-        report_path = f"Ozon_Sales_{start_dt.strftime('%d%m%Y')}-{end_dt.strftime('%d%m%Y')}.xlsx"
-        # === Подготавливаем данные по исходным артикулам ===
+        # === Подготовка исходных артикулов для Excel ===
         raw_art_data = []
         for art in art_data:
             if art.lower().startswith("тип_начисления:"):
-                continue  # пропускаем служебные записи
+                continue
             data = art_data[art]
             purchases = data["purchases"]
             cancels = data["cancels"]
@@ -456,41 +468,24 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                 "profit_per_unit": profit_per_unit
             })
 
-        # Сортируем по выкупам (по убыванию) — как в топ-5
         raw_art_data.sort(key=lambda x: x["purchases"], reverse=True)
 
-        # Теперь вызываем create_excel_report с новым параметром
+        # === Создание Excel ===
+        report_path = f"Ozon_Sales_{start_dt.strftime('%d%m%Y')}-{end_dt.strftime('%d%m%Y')}.xlsx"
         create_excel_report(
             grouped, unmatched, id_to_name, main_ids_ordered, report_path,
             total_orders, total_purchases, total_cancels, total_income,
-            raw_art_data=raw_art_data  # ← добавили
+            raw_art_data=raw_art_data
         )
 
-        # === Формируем топ-5 артикулов по выкупам ===
-        art_performance = []
-        for art in art_data:
-            if art.lower().startswith("тип_начисления:"):
-                continue
-            purchases = art_data[art]["purchases"]
-            if purchases > 0:
-                profit = income.get(art, 0)
-                art_performance.append({
-                    "art": art,
-                    "purchases": purchases,
-                    "profit": profit
-                })
+        # === Топ-5 для текста ===
+        top_5 = raw_art_data[:5]
 
-        # Сортируем по выкупам (по убыванию)
-        art_performance.sort(key=lambda x: x["purchases"], reverse=True)
-        top_5 = art_performance[:5]
-
-        # === Форматируем числа ===
         def fmt_num(x):
             if isinstance(x, float):
                 return f"{x:,.2f}".replace(",", " ")
             return f"{x:,}".replace(",", " ")
 
-        # === Формируем текстовое сообщение ===
         total_shipments = total_purchases + total_cancels
         purchase_percent = (total_purchases / total_shipments * 100) if total_shipments > 0 else 0
         avg_profit_per_unit = total_income / total_purchases if total_purchases > 0 else 0
@@ -521,13 +516,12 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         else:
             text_summary += "   — Нет данных по выкупам\n"
 
-        # Отправляем Excel-файл
+        # === Отправка ===
         await update.message.reply_document(
             document=open(report_path, 'rb'),
             caption=f"📊 Подробный отчёт в Excel по продажам Ozon (кабинет {cabinet_id})\nПериод: {start_str} – {end_str}"
         )
 
-        # Отправляем текстовое сообщение (гарантированно строка!)
         await update.message.reply_text(
             text_summary,
             parse_mode="HTML",
@@ -546,16 +540,14 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
     return ConversationHandler.END
 
+
 def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path,
                         total_orders, total_purchases, total_cancels, total_income,
                         raw_art_data=None):
-    from openpyxl.styles import PatternFill
-
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Сводный"
 
-    # === Лист 1: Сводный ===
     headers1 = ["Показатель", "Значение"]
     ws1.append(headers1)
     for cell in ws1[1]:
@@ -573,7 +565,7 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     purchase_percent = (total_purchases / total_shipments * 100) if total_shipments > 0 else 0
     ws1.append(["Процент выкупов", f"{purchase_percent:.2f}%"])
 
-    # === Лист 2: Подробный (по шаблону) ===
+    # === Подробный (по шаблону) ===
     ws2 = wb.create_sheet(title="Подробный")
     headers2 = [
         "Наименование",
@@ -592,7 +584,6 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     orange_fill = PatternFill(start_color="FFCC99", end_color="FFCC99", fill_type="solid")
 
     row_index = 2
-
     for group_id in main_ids_ordered:
         data = grouped.get(group_id, {})
         name = data.get('name', f"Группа {group_id}")
@@ -620,10 +611,9 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
             percent_cell.fill = red_fill
         elif 50 < purchase_percent_val <= 60:
             percent_cell.fill = orange_fill
-
         row_index += 1
 
-    # Неопознанные артикулы
+    # Неопознанные
     unknown_articles = []
     service_types = []
 
@@ -665,7 +655,6 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
             percent_cell.fill = red_fill
         elif 50 < purchase_percent_val <= 60:
             percent_cell.fill = orange_fill
-
         row_index += 1
 
     for name, data in service_types:
@@ -681,8 +670,8 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         ])
         row_index += 1
 
-    # === Лист 3: Исходные артикулы (новый!) ===
-    if raw_art_data is not None and raw_art_data:
+    # === Исходные артикулы ===
+    if raw_art_data:
         ws3 = wb.create_sheet(title="Исходные артикулы")
         headers3 = [
             "Артикул (offer_id)",
@@ -717,16 +706,14 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
                 cancels
             ])
 
-            # Опционально: можно добавить цветовую индикацию, как в "Подробный"
             percent_cell = ws3.cell(row=row_idx, column=4)
             if purchase_percent <= 50:
                 percent_cell.fill = red_fill
             elif 50 < purchase_percent <= 60:
                 percent_cell.fill = orange_fill
-
             row_idx += 1
 
-    # === Форматирование всех листов ===
+    # === Форматирование ===
     thin_border = Border(
         left=Side(style='thin'),
         right=Side(style='thin'),
