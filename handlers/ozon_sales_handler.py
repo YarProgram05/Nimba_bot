@@ -266,7 +266,21 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
             logger.info(f"Запрос финансов {i}/{len(date_chunks)}: {chunk_start.date()} – {chunk_end.date()}")
             start_iso = chunk_start.strftime("%Y-%m-%dT00:00:00.000Z")
             end_iso = chunk_end.strftime("%Y-%m-%dT23:59:59.999Z")
-            ops = ozon.get_financial_operations(start_iso, end_iso)
+
+            # Retry-логика для устойчивости к 504 ошибкам
+            ops = None
+            for attempt in range(3):
+                try:
+                    ops = ozon.get_financial_operations(start_iso, end_iso)
+                    break
+                except Exception as e:
+                    if "504" in str(e) or "502" in str(e) or "timeout" in str(e).lower():
+                        logger.warning(f"⚠️ Финансы: попытка {attempt + 1}/3 провалена для {chunk_start.date()}")
+                        if attempt < 2:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                    raise
+
             all_operations.extend(ops)
             await asyncio.sleep(0.5)
 
@@ -417,32 +431,95 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         # === Создаём отчёт ===
         report_path = f"Ozon_Sales_{start_dt.strftime('%d%m%Y')}-{end_dt.strftime('%d%m%Y')}.xlsx"
-        create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, report_path, total_orders,
-                            total_purchases, total_cancels, total_income)
+        # === Подготавливаем данные по исходным артикулам ===
+        raw_art_data = []
+        for art in art_data:
+            if art.lower().startswith("тип_начисления:"):
+                continue  # пропускаем служебные записи
+            data = art_data[art]
+            purchases = data["purchases"]
+            cancels = data["cancels"]
+            orders = data["orders"]
+            profit = income.get(art, 0)
+
+            total_shipments = purchases + cancels
+            purchase_percent_val = (purchases / total_shipments * 100) if total_shipments > 0 else 0
+            profit_per_unit = profit / purchases if purchases > 0 else 0
+
+            raw_art_data.append({
+                "art": art,
+                "orders": orders,
+                "purchases": purchases,
+                "cancels": cancels,
+                "profit": profit,
+                "purchase_percent": purchase_percent_val,
+                "profit_per_unit": profit_per_unit
+            })
+
+        # Сортируем по выкупам (по убыванию) — как в топ-5
+        raw_art_data.sort(key=lambda x: x["purchases"], reverse=True)
+
+        # Теперь вызываем create_excel_report с новым параметром
+        create_excel_report(
+            grouped, unmatched, id_to_name, main_ids_ordered, report_path,
+            total_orders, total_purchases, total_cancels, total_income,
+            raw_art_data=raw_art_data  # ← добавили
+        )
+
+        # === Формируем топ-5 артикулов по выкупам ===
+        art_performance = []
+        for art in art_data:
+            if art.lower().startswith("тип_начисления:"):
+                continue
+            purchases = art_data[art]["purchases"]
+            if purchases > 0:
+                profit = income.get(art, 0)
+                art_performance.append({
+                    "art": art,
+                    "purchases": purchases,
+                    "profit": profit
+                })
+
+        # Сортируем по выкупам (по убыванию)
+        art_performance.sort(key=lambda x: x["purchases"], reverse=True)
+        top_5 = art_performance[:5]
+
+        # === Форматируем числа ===
+        def fmt_num(x):
+            if isinstance(x, float):
+                return f"{x:,.2f}".replace(",", " ")
+            return f"{x:,}".replace(",", " ")
 
         # === Формируем текстовое сообщение ===
         total_shipments = total_purchases + total_cancels
         purchase_percent = (total_purchases / total_shipments * 100) if total_shipments > 0 else 0
         avg_profit_per_unit = total_income / total_purchases if total_purchases > 0 else 0
 
-        # Форматируем числа
-        def fmt_num(x):
-            if isinstance(x, float):
-                return f"{x:,.2f}".replace(",", " ")
-            return f"{x:,}".replace(",", " ")
-
         text_summary = (
             f"📊 <b>Сводка по продажам Ozon</b>\n"
             f"Кабинет: <b>Озон {cabinet_id}</b>\n"
             f"Период: <b>{start_str} – {end_str}</b>\n\n"
-
             f"📦 <b>Заказы:</b> {fmt_num(total_orders)} шт\n"
             f"✅ <b>Выкупы:</b> {fmt_num(total_purchases)} шт\n"
             f"❌ <b>Отмены:</b> {fmt_num(total_cancels)} шт\n"
             f"💰 <b>Валовая прибыль:</b> {fmt_num(total_income)} ₽\n"
             f"📈 <b>Прибыль на 1 ед:</b> {fmt_num(avg_profit_per_unit)} ₽\n"
             f"🔄 <b>Процент выкупов:</b> {purchase_percent:.2f}%"
+            f"\n\n🏆 <b>Топ-5 артикулов по выкупам:</b>\n"
         )
+
+        if top_5:
+            for i, item in enumerate(top_5, 1):
+                art = item["art"]
+                purchases = item["purchases"]
+                profit = item["profit"]
+                text_summary += (
+                    f"🔹 {i}. <b>{art}</b>\n"
+                    f"   ✅ Выкупы: {fmt_num(purchases)} шт\n"
+                    f"   💰 Прибыль: {fmt_num(profit)} ₽\n\n"
+                )
+        else:
+            text_summary += "   — Нет данных по выкупам\n"
 
         # Отправляем Excel-файл
         await update.message.reply_document(
@@ -450,7 +527,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
             caption=f"📊 Подробный отчёт в Excel по продажам Ozon (кабинет {cabinet_id})\nПериод: {start_str} – {end_str}"
         )
 
-        # Отправляем текстовое сообщение
+        # Отправляем текстовое сообщение (гарантированно строка!)
         await update.message.reply_text(
             text_summary,
             parse_mode="HTML",
@@ -469,15 +546,16 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
     return ConversationHandler.END
 
-
-def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path, total_orders, total_purchases,
-                        total_cancels, total_income):
+def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path,
+                        total_orders, total_purchases, total_cancels, total_income,
+                        raw_art_data=None):
     from openpyxl.styles import PatternFill
 
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Сводный"
 
+    # === Лист 1: Сводный ===
     headers1 = ["Показатель", "Значение"]
     ws1.append(headers1)
     for cell in ws1[1]:
@@ -495,6 +573,7 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     purchase_percent = (total_purchases / total_shipments * 100) if total_shipments > 0 else 0
     ws1.append(["Процент выкупов", f"{purchase_percent:.2f}%"])
 
+    # === Лист 2: Подробный (по шаблону) ===
     ws2 = wb.create_sheet(title="Подробный")
     headers2 = [
         "Наименование",
@@ -502,14 +581,13 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         "Валовая прибыль, руб",
         "Процент выкупов",
         "Прибыль на 1 ед, руб",
-        "Заказы, шт",  # ← 6-й столбец
-        "Отмены, шт"  # ← 7-й столбец
+        "Заказы, шт",
+        "Отмены, шт"
     ]
     ws2.append(headers2)
     for cell in ws2[1]:
         cell.font = Font(bold=True)
 
-    # Цвета для процентов
     red_fill = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
     orange_fill = PatternFill(start_color="FFCC99", end_color="FFCC99", fill_type="solid")
 
@@ -533,11 +611,10 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
             income_val,
             f"{purchase_percent_val:.2f}%",
             profit_per_unit,
-            orders,  # ← заказы
-            cancels  # ← отмены
+            orders,
+            cancels
         ])
 
-        # Цвет для ячейки "Процент выкупов" (столбец D = 4)
         percent_cell = ws2.cell(row=row_index, column=4)
         if purchase_percent_val <= 50:
             percent_cell.fill = red_fill
@@ -579,8 +656,8 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
             income_val,
             f"{purchase_percent_val:.2f}%",
             profit_per_unit,
-            orders,  # ← заказы
-            cancels  # ← отмены
+            orders,
+            cancels
         ])
 
         percent_cell = ws2.cell(row=row_index, column=4)
@@ -604,7 +681,52 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         ])
         row_index += 1
 
-    # Форматирование
+    # === Лист 3: Исходные артикулы (новый!) ===
+    if raw_art_data is not None and raw_art_data:
+        ws3 = wb.create_sheet(title="Исходные артикулы")
+        headers3 = [
+            "Артикул (offer_id)",
+            "Выкупы, шт",
+            "Валовая прибыль, руб",
+            "Процент выкупов",
+            "Прибыль на 1 ед, руб",
+            "Заказы, шт",
+            "Отмены, шт"
+        ]
+        ws3.append(headers3)
+        for cell in ws3[1]:
+            cell.font = Font(bold=True)
+
+        row_idx = 2
+        for item in raw_art_data:
+            art = item["art"]
+            purchases = item["purchases"]
+            profit = item["profit"]
+            purchase_percent = item["purchase_percent"]
+            profit_per_unit = item["profit_per_unit"]
+            orders = item["orders"]
+            cancels = item["cancels"]
+
+            ws3.append([
+                art,
+                purchases,
+                profit,
+                f"{purchase_percent:.2f}%",
+                profit_per_unit,
+                orders,
+                cancels
+            ])
+
+            # Опционально: можно добавить цветовую индикацию, как в "Подробный"
+            percent_cell = ws3.cell(row=row_idx, column=4)
+            if purchase_percent <= 50:
+                percent_cell.fill = red_fill
+            elif 50 < purchase_percent <= 60:
+                percent_cell.fill = orange_fill
+
+            row_idx += 1
+
+    # === Форматирование всех листов ===
     thin_border = Border(
         left=Side(style='thin'),
         right=Side(style='thin'),
@@ -612,7 +734,7 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         bottom=Side(style='thin')
     )
 
-    for ws in [ws1, ws2]:
+    for ws in wb.worksheets:
         for row in ws.iter_rows():
             for cell in row:
                 if cell.value is not None:

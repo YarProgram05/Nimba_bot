@@ -302,7 +302,7 @@ async def handle_report_type_choice(update: Update, context: CallbackContext) ->
 
     report_type = query.data
     stock_dict = context.user_data.get('ozon_stock_dict', {})
-    offer_id_to_name = context.user_data.get('offer_id_to_name', {})
+    cabinet_id = context.user_data.get('ozon_cabinet_id', 1)  # ← добавили
 
     try:
         if report_type == 'raw':
@@ -324,7 +324,6 @@ async def handle_report_type_choice(update: Update, context: CallbackContext) ->
                     'Итого на МП': total
                 })
 
-            # ✅ Сортировка по "Наименование" от А до Я
             df = pd.DataFrame(report_data).sort_values(by='Наименование', key=lambda x: x.str.lower()).reset_index(drop=True)
             headers = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже", "Итого на МП"]
 
@@ -394,6 +393,26 @@ async def handle_report_type_choice(update: Update, context: CallbackContext) ->
         else:
             raise ValueError("Неизвестный тип отчёта")
 
+        # === 💡 Считаем сводные итоги по ВСЕМ артикулам (из stock_dict) ===
+        total_available = sum(data['available_stock_count'] for data in stock_dict.values())
+        total_returning = sum(data['return_from_customer_stock_count'] for data in stock_dict.values())
+        total_prepare = sum(data['other_stock_count'] for data in stock_dict.values())
+        total_mp = total_available + total_returning + total_prepare
+
+        # Форматируем числа
+        def fmt_num(x):
+            return f"{x:,}".replace(",", " ")
+
+        # Формируем текст сводки
+        summary_text = (
+            f"📊 <b>Сводка по остаткам Ozon</b>\n"
+            f"Кабинет: <b>Озон {cabinet_id}</b>\n\n"
+            f"📦 <b>Доступно на складах:</b> {fmt_num(total_available)} шт\n"
+            f"↩️ <b>Возвращаются от покупателей:</b> {fmt_num(total_returning)} шт\n"
+            f"🔄 <b>Подготовка к продаже:</b> {fmt_num(total_prepare)} шт\n"
+            f"✅ <b>Итого на МП:</b> {fmt_num(total_mp)} шт"
+        )
+
         # ✅ Создаём Excel с форматированием
         report_path = "Ozon_Remains_Report.xlsx"
         create_formatted_excel(df, headers, report_path)
@@ -403,6 +422,12 @@ async def handle_report_type_choice(update: Update, context: CallbackContext) ->
             document=open(report_path, 'rb'),
             caption=f"📊 Отчёт по остаткам Ozon ({'исходные артикулы' if report_type == 'raw' else 'шаблон Nimba'})",
             reply_markup=ReplyKeyboardRemove()
+        )
+
+        # 💬 Отправляем сводку текстом
+        await query.message.reply_text(
+            summary_text,
+            parse_mode="HTML"
         )
 
         # 🧹 Очистка
@@ -417,7 +442,6 @@ async def handle_report_type_choice(update: Update, context: CallbackContext) ->
         )
 
     return ConversationHandler.END
-
 
 def group_ozon_remains_data(stock_data, art_to_id, id_to_name):
     """Группировка данных остатков Ozon по шаблону"""
