@@ -9,25 +9,17 @@ if utils_path not in sys.path:
 from template_loader import load_template
 from excel_utils import create_report
 
-
 import pandas as pd
 import logging
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import CallbackContext, ConversationHandler, filters
-
-# Исправляем импорты
-import sys
-import os
-current_dir = os.path.dirname(os.path.abspath(__file__))
-root_dir = os.path.dirname(current_dir)
-sys.path.append(root_dir)
-
+from states import WB_REPORT_FILES
 
 logger = logging.getLogger(__name__)
 
 
 async def start_wb_report(update: Update, context: CallbackContext) -> int:
-    """Начало обработки отчета Wildberries"""
+    """Начало обработки отчета Wildberries (ПРОДАЖИ)"""
     context.user_data['wb_files'] = []
 
     # Создание клавиатуры
@@ -35,21 +27,21 @@ async def start_wb_report(update: Update, context: CallbackContext) -> int:
     reply_markup = ReplyKeyboardMarkup(
         buttons,
         resize_keyboard=True,
-        one_time_keyboard=True
+        one_time_keyboard=False  # Клавиатура остаётся, чтобы было удобно
     )
 
     await update.message.reply_text(
-        "📤 Пожалуйста, отправьте файлы для Wildberries:\n\n"
-        "1. Файл продаж ('ВБ_продажи')\n\n"
-        "После отправки файла нажмите кнопку ниже ⬇️",
+        "📤 Пожалуйста, отправьте файл продаж Wildberries:\n\n"
+        "📎 Название файла должно содержать 'продажи' (например, 'ВБ_продажи.xlsx')\n\n"
+        "После отправки всех файлов нажмите кнопку ниже ⬇️",
         reply_markup=reply_markup
     )
 
-    return 2  # Состояние ожидания файлов
+    return WB_REPORT_FILES
 
 
 async def handle_wb_files(update: Update, context: CallbackContext) -> int:
-    """Обработка файлов Wildberries"""
+    """Обработка файлов Wildberries (ПРОДАЖИ)"""
     user_data = context.user_data
     document = update.message.document
     file_name = document.file_name
@@ -57,7 +49,7 @@ async def handle_wb_files(update: Update, context: CallbackContext) -> int:
     # Проверка типа файла
     if not file_name.lower().endswith('.xlsx'):
         await update.message.reply_text("❌ Файл должен быть в формате Excel (.xlsx)")
-        return 2
+        return WB_REPORT_FILES
 
     # Скачивание файла
     file = await context.bot.get_file(document)
@@ -66,13 +58,22 @@ async def handle_wb_files(update: Update, context: CallbackContext) -> int:
 
     # Сохранение файла
     user_data.setdefault('wb_files', []).append(file_path)
-    await update.message.reply_text(f"✅ Файл Wildberries '{file_name}' получен")
 
-    return 2
+    # Уточняем: это файл ПРОДАЖ
+    await update.message.reply_text(
+        f"✅ Файл продаж Wildberries '{file_name}' получен.\n"
+        "Нажмите «Все файлы отправлены», если готовы сформировать отчёт.",
+        reply_markup=ReplyKeyboardMarkup([["Все файлы отправлены"]], resize_keyboard=True)
+    )
+
+    return WB_REPORT_FILES
 
 
 async def generate_wb_report(update: Update, context: CallbackContext) -> int:
-    """Генерация отчета Wildberries"""
+    """Генерация отчета Wildberries (ПРОДАЖИ)"""
+    logger.info("Вызвана generate_wb_report для продаж WB")
+    logger.info(f"Получено сообщение: '{update.message.text}'")
+
     user_data = context.user_data
     wb_files = user_data.get('wb_files', [])
 
@@ -84,7 +85,7 @@ async def generate_wb_report(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
 
     try:
-        await update.message.reply_text("⏳ Обрабатываю файлы Wildberries...")
+        await update.message.reply_text("⏳ Обрабатываю файлы продаж Wildberries...")
 
         # Загрузка шаблона
         art_to_id, id_to_name, main_ids_ordered = load_template("Шаблон_WB")
@@ -132,13 +133,15 @@ async def generate_wb_report(update: Update, context: CallbackContext) -> int:
 
         # Очистка временных файлов
         for file_path in wb_files:
-            os.remove(file_path)
-        os.remove(report_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        if os.path.exists(report_path):
+            os.remove(report_path)
 
     except Exception as e:
         logger.error(f"Ошибка обработки Wildberries: {str(e)}", exc_info=True)
         await update.message.reply_text(
-            f"❌ Ошибка при обработки файлов Wildberries: {str(e)}",
+            f"❌ Ошибка при обработке файлов Wildberries: {str(e)}",
             reply_markup=ReplyKeyboardRemove()
         )
 
@@ -147,7 +150,7 @@ async def generate_wb_report(update: Update, context: CallbackContext) -> int:
 
 def process_wb_sales(file_path):
     """Обработка файла продаж Wildberries"""
-    # Поиск нужных столбцов
+    df = None
     for i in range(10):
         try:
             df = pd.read_excel(file_path, header=i)
@@ -157,40 +160,37 @@ def process_wb_sales(file_path):
                 'Выкупили, шт.',
                 'К перечислению за товар, руб.'
             ]
-
             if all(col in df.columns for col in required_columns):
                 break
-        except:
+        except Exception:
             continue
 
-    # Сбор данных
-    purchases = {}  # Выкупы
-    orders = {}  # Заказы
-    income = {}  # Начисления
-    cancels = {}  # Отмены
+    if df is None:
+        raise ValueError("Не удалось найти таблицу с нужными столбцами в файле")
+
+    purchases = {}
+    orders = {}
+    income = {}
+    cancels = {}
 
     for _, row in df.iterrows():
         art = str(row['Артикул продавца']).strip().lower()
         if not art or art == 'nan':
             continue
 
-        # Получаем значения
         ordered = row['шт.']
         purchased = row['Выкупили, шт.']
         amount = row['К перечислению за товар, руб.']
 
-        # Если значения не числа, пропускаем
         if not isinstance(ordered, (int, float)) or not isinstance(purchased, (int, float)):
             continue
 
-        # Суммируем данные
         orders[art] = orders.get(art, 0) + ordered
         purchases[art] = purchases.get(art, 0) + purchased
-        income[art] = income.get(art, 0) + amount
+        income[art] = income.get(art, 0) + (amount if pd.notna(amount) else 0)
 
-    # Рассчитываем отмены
     for art in orders:
-        cancels[art] = orders[art] - purchases[art]
+        cancels[art] = orders[art] - purchases.get(art, 0)
 
     return purchases, cancels, income
 
@@ -203,7 +203,6 @@ def group_wb_data(purchases, cancels, income, art_to_id, id_to_name):
     unmatched = {}
 
     for art in all_arts:
-        # Поиск соответствия в шаблоне
         group_id = art_to_id.get(art, None)
 
         if group_id is not None:

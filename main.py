@@ -180,24 +180,29 @@ def main() -> None:
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("help", show_help),
-            # Добавляем обработку текста из главного меню как entry point
-            MessageHandler(filters.Regex(
-                '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'),
-                select_action),
+            MessageHandler(
+                filters.Regex(
+                    '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
+                ),
+                select_action
+            ),
         ],
         states={
             SELECTING_ACTION: [
-                MessageHandler(filters.Regex(
-                    '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'),
-                    select_action),
+                MessageHandler(
+                    filters.Regex(
+                        '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
+                    ),
+                    select_action
+                ),
             ],
             WB_REPORT_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_files),
-                MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_wb_report),
+                MessageHandler(filters.Text("Все файлы отправлены"), generate_wb_report),
             ],
             WB_REMAINS_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_remains_files),
-                MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_wb_remains_report),
+                MessageHandler(filters.Text("Все файлы отправлены"), generate_wb_remains_report),
             ],
             OZON_REMAINS_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_cabinet_choice),
@@ -207,11 +212,11 @@ def main() -> None:
             ],
             BARCODE_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_barcode_files),
-                MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_barcode_report),
+                MessageHandler(filters.Text("Все файлы отправлены"), generate_barcode_report),
             ],
             CSV_FILES: [
                 MessageHandler(filters.Document.FileExtension("csv"), handle_csv_files),
-                MessageHandler(filters.Regex('^Все файлы отправлены$'), generate_xlsx_files),
+                MessageHandler(filters.Text("Все файлы отправлены"), generate_xlsx_files),
             ],
             OZON_SALES_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_sales_cabinet_choice),

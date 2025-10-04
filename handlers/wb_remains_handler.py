@@ -4,6 +4,8 @@ import pandas as pd
 import logging
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import CallbackContext, ConversationHandler
+from states import WB_REMAINS_FILES
+
 
 # Получаем пути
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -37,7 +39,7 @@ async def start_wb_remains(update: Update, context: CallbackContext) -> int:
         reply_markup=reply_markup
     )
 
-    return 4  # Состояние ожидания файлов остатков WB
+    return WB_REMAINS_FILES  # Состояние ожидания файлов остатков WB
 
 
 async def handle_wb_remains_files(update: Update, context: CallbackContext) -> int:
@@ -49,7 +51,7 @@ async def handle_wb_remains_files(update: Update, context: CallbackContext) -> i
     # Проверка типа файла
     if not file_name.lower().endswith('.xlsx'):
         await update.message.reply_text("❌ Файл должен быть в формате Excel (.xlsx)")
-        return 4
+        return WB_REMAINS_FILES
 
     # Скачивание файла
     file = await context.bot.get_file(document)
@@ -60,7 +62,7 @@ async def handle_wb_remains_files(update: Update, context: CallbackContext) -> i
     user_data.setdefault('wb_remains_files', []).append(file_path)
     await update.message.reply_text(f"✅ Файл остатков Wildberries '{file_name}' получен")
 
-    return 4
+    return WB_REMAINS_FILES
 
 
 async def generate_wb_remains_report(update: Update, context: CallbackContext) -> int:
