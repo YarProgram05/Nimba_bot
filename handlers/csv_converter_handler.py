@@ -6,6 +6,7 @@ import shutil
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import CallbackContext, ConversationHandler
 import logging
+from states import CSV_FILES
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
@@ -201,7 +202,7 @@ async def start_csv_conversion(update: Update, context: CallbackContext) -> int:
         reply_markup=reply_markup
     )
 
-    return 6  # Состояние ожидания CSV файлов
+    return CSV_FILES  # Состояние ожидания CSV файлов
 
 
 async def handle_csv_files(update: Update, context: CallbackContext) -> int:
@@ -213,7 +214,7 @@ async def handle_csv_files(update: Update, context: CallbackContext) -> int:
     # Проверка типа файла
     if not file_name.lower().endswith('.csv'):
         await update.message.reply_text("❌ Файл должен быть в формате CSV (.csv)")
-        return 6
+        return CSV_FILES
 
     # Скачивание файла
     file = await context.bot.get_file(document)
@@ -224,7 +225,7 @@ async def handle_csv_files(update: Update, context: CallbackContext) -> int:
     user_data.setdefault('csv_files', []).append(file_path)
     await update.message.reply_text(f"✅ Файл '{file_name}' получен")
 
-    return 6
+    return CSV_FILES
 
 
 async def generate_xlsx_files(update: Update, context: CallbackContext) -> int:

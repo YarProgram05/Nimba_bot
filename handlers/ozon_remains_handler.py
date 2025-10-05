@@ -23,7 +23,7 @@ if utils_dir not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-from states import OZON_REMAINS_CABINET_CHOICE, OZON_REMAINS_REPORT_TYPE
+from states import OZON_REMAINS_CABINET_CHOICE  # Убрано OZON_REMAINS_REPORT_TYPE
 
 # ======================
 # Ozon API Класс
@@ -132,7 +132,7 @@ def chunk_list(lst, n):
 
 async def start_ozon_remains(update: Update, context: CallbackContext) -> int:
     """Начало — выбор кабинета Ozon"""
-    context.user_data['current_flow'] = 'remains'  # ← ДОБАВЬТЕ ЭТО!
+    context.user_data['current_flow'] = 'remains'
 
     keyboard = [
         [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='cabinet_1')],
@@ -147,24 +147,22 @@ async def start_ozon_remains(update: Update, context: CallbackContext) -> int:
 
     return OZON_REMAINS_CABINET_CHOICE
 
+
 async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int:
-    """Обработка выбора кабинета Ozon"""
+    """Обработка выбора кабинета Ozon — сразу генерируем оба отчёта"""
     query = update.callback_query
     await query.answer()
 
-    cabinet_data = query.data  # cabinet_1 или cabinet_2
+    cabinet_data = query.data
     cabinet_id = 1 if cabinet_data == 'cabinet_1' else 2
-
-    # Сохраняем выбор в user_data
     context.user_data['ozon_cabinet_id'] = cabinet_id
 
     await query.message.edit_text(f"⏳ Получаю остатки с Ozon API (Озон {cabinet_id})...")
 
     try:
-        # 1️⃣ Инициализируем API с выбранным кабинетом
         ozon = OzonAPI(cabinet_id=cabinet_id)
 
-        # 2️⃣ Получаем список товаров
+        # --- Получение данных ---
         product_list = ozon.get_product_list(limit=1000)
         if not product_list:
             raise Exception("Не удалось получить список товаров")
@@ -173,14 +171,12 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
         if not items:
             raise Exception("Товары не найдены")
 
-        # 3️⃣ Собираем offer_id
         offer_ids = []
         for item in items:
             offer_id = clean_offer_id(item.get('offer_id'))
             if offer_id:
                 offer_ids.append(offer_id)
 
-        # 4️⃣ Получаем SKU
         all_skus = []
         offer_id_to_name = {}
 
@@ -212,7 +208,6 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
         if not all_skus:
             raise Exception("Не удалось получить SKU")
 
-        # 5️⃣ Получаем аналитику остатков
         stock_dict = {}
 
         for sku_chunk in chunk_list(all_skus, 100):
@@ -235,7 +230,6 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                     }
             time.sleep(0.5)
 
-        # 6️⃣ Fallback для отсутствующих
         missing_offer_ids = list(set(offer_ids) - set(stock_dict.keys()))
         if missing_offer_ids:
             for chunk in chunk_list(missing_offer_ids, 100):
@@ -269,141 +263,94 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
 
                 time.sleep(0.5)
 
-        # ✅ Сохраняем данные в context
-        context.user_data['ozon_stock_dict'] = stock_dict
-        context.user_data['offer_id_to_name'] = offer_id_to_name
+        # === 1. Отчёт по исходным артикулам ===
+        raw_data = []
+        for offer_id, data in stock_dict.items():
+            name = data['name']
+            available = data['available_stock_count']
+            returning = data['return_from_customer_stock_count']
+            prepare = data['other_stock_count']
+            total = available + returning + prepare
+            raw_data.append({
+                'Наименование': name,
+                'Артикул': offer_id,
+                'Доступно на складах': available,
+                'Возвращаются от покупателей': returning,
+                'Подготовка к продаже': prepare,
+                'Итого на МП': total
+            })
 
-        # ➡️ Отправляем кнопки выбора отчёта
-        keyboard = [
-            [InlineKeyboardButton("📊 Исходные артикулы (как в Ozon)", callback_data='raw')],
-            [InlineKeyboardButton("🧩 Группировка по шаблону Nimba", callback_data='template')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        df_raw = pd.DataFrame(raw_data).sort_values(by='Наименование', key=lambda x: x.str.lower()).reset_index(drop=True)
+        headers_raw = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже", "Итого на МП"]
 
-        await query.message.reply_text(
-            "✅ Данные получены! Выберите формат отчёта:",
-            reply_markup=reply_markup
-        )
+        # === 2. Отчёт по шаблону Nimba ===
+        template_path = os.path.join(root_dir, "База данных артикулов для выкупов и начислений.xlsx")
+        if not os.path.exists(template_path):
+            template_path = "База данных артикулов для выкупов и начислений.xlsx"
+        if not os.path.exists(template_path):
+            raise Exception("Файл шаблона не найден!")
 
-        return OZON_REMAINS_REPORT_TYPE
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("template_loader", os.path.join(utils_dir, "template_loader.py"))
+        template_loader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(template_loader)
 
-    except Exception as e:
-        logger.error(f"Ошибка при получении данных: {str(e)}", exc_info=True)
-        await query.message.reply_text(
-            f"❌ Ошибка: {str(e)}",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ConversationHandler.END
+        art_to_id, id_to_name, main_ids_ordered = template_loader.load_template("Шаблон_Ozon")
 
-async def handle_report_type_choice(update: Update, context: CallbackContext) -> int:
-    """Обработка выбора типа отчёта"""
-    query = update.callback_query
-    await query.answer()
+        stock_data = {}
+        for offer_id, data in stock_dict.items():
+            stock_data[offer_id] = {
+                "available": data['available_stock_count'],
+                "returning": data['return_from_customer_stock_count'],
+                "prepare": data['other_stock_count']
+            }
 
-    report_type = query.data
-    stock_dict = context.user_data.get('ozon_stock_dict', {})
-    cabinet_id = context.user_data.get('ozon_cabinet_id', 1)  # ← добавили
+        grouped, unmatched = group_ozon_remains_data(stock_data, art_to_id, id_to_name)
 
-    try:
-        if report_type == 'raw':
-            # 📄 Отчёт по исходным артикулам
-            report_data = []
-            for offer_id, data in stock_dict.items():
-                name = data['name']
-                available = data['available_stock_count']
-                returning = data['return_from_customer_stock_count']
-                prepare = data['other_stock_count']
-                total = available + returning + prepare
-
-                report_data.append({
-                    'Наименование': name,
-                    'Артикул': offer_id,
-                    'Доступно на складах': available,
-                    'Возвращаются от покупателей': returning,
-                    'Подготовка к продаже': prepare,
+        template_data = []
+        for id_val in main_ids_ordered:
+            if id_val in grouped:
+                d = grouped[id_val]
+                total = d['available'] + d['returning'] + d['prepare']
+                template_data.append({
+                    'Артикул': d['name'],
+                    'Доступно на складах': d['available'],
+                    'Возвращаются от покупателей': d['returning'],
+                    'Подготовка к продаже': d['prepare'],
                     'Итого на МП': total
                 })
-
-            df = pd.DataFrame(report_data).sort_values(by='Наименование', key=lambda x: x.str.lower()).reset_index(drop=True)
-            headers = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже", "Итого на МП"]
-
-        elif report_type == 'template':
-            # 📄 Отчёт по шаблону — БЕЗ столбца "Наименование"
-            template_path = os.path.join(root_dir, "База данных артикулов для выкупов и начислений.xlsx")
-            if not os.path.exists(template_path):
-                template_path = "База данных артикулов для выкупов и начислений.xlsx"
-
-            if not os.path.exists(template_path):
-                raise Exception("Файл шаблона не найден!")
-
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("template_loader",
-                                                          os.path.join(utils_dir, "template_loader.py"))
-            template_loader = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(template_loader)
-
-            art_to_id, id_to_name, main_ids_ordered = template_loader.load_template("Шаблон_Ozon")
-
-            stock_data = {}
-            for offer_id, data in stock_dict.items():
-                stock_data[offer_id] = {
-                    "available": data['available_stock_count'],
-                    "returning": data['return_from_customer_stock_count'],
-                    "prepare": data['other_stock_count']
-                }
-
-            grouped, unmatched = group_ozon_remains_data(stock_data, art_to_id, id_to_name)
-
-            report_data = []
-
-            for id_val in main_ids_ordered:
-                if id_val in grouped:
-                    data = grouped[id_val]
-                    total = data['available'] + data['returning'] + data['prepare']
-                    report_data.append({
-                        'Артикул': data['name'],
-                        'Доступно на складах': data['available'],
-                        'Возвращаются от покупателей': data['returning'],
-                        'Подготовка к продаже': data['prepare'],
-                        'Итого на МП': total
-                    })
-                else:
-                    name = id_to_name.get(id_val, f"ID {id_val}")
-                    report_data.append({
-                        'Артикул': name,
-                        'Доступно на складах': 0,
-                        'Возвращаются от покупателей': 0,
-                        'Подготовка к продаже': 0,
-                        'Итого на МП': 0
-                    })
-
-            for art, data in unmatched.items():
-                total = data['available'] + data['returning'] + data['prepare']
-                report_data.append({
-                    'Артикул': f"НЕОПОЗНАННЫЙ: {art}",
-                    'Доступно на складах': data['available'],
-                    'Возвращаются от покупателей': data['returning'],
-                    'Подготовка к продаже': data['prepare'],
-                    'Итого на МП': total
+            else:
+                name = id_to_name.get(id_val, f"ID {id_val}")
+                template_data.append({
+                    'Артикул': name,
+                    'Доступно на складах': 0,
+                    'Возвращаются от покупателей': 0,
+                    'Подготовка к продаже': 0,
+                    'Итого на МП': 0
                 })
 
-            df = pd.DataFrame(report_data)
-            headers = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже", "Итого на МП"]
+        for art, d in unmatched.items():
+            total = d['available'] + d['returning'] + d['prepare']
+            template_data.append({
+                'Артикул': f"НЕОПОЗНАННЫЙ: {art}",
+                'Доступно на складах': d['available'],
+                'Возвращаются от покупателей': d['returning'],
+                'Подготовка к продаже': d['prepare'],
+                'Итого на МП': total
+            })
 
-        else:
-            raise ValueError("Неизвестный тип отчёта")
+        df_template = pd.DataFrame(template_data)
+        headers_template = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже", "Итого на МП"]
 
-        # === 💡 Считаем сводные итоги по ВСЕМ артикулам (из stock_dict) ===
+        # === Сводка по всем остаткам ===
         total_available = sum(data['available_stock_count'] for data in stock_dict.values())
         total_returning = sum(data['return_from_customer_stock_count'] for data in stock_dict.values())
         total_prepare = sum(data['other_stock_count'] for data in stock_dict.values())
         total_mp = total_available + total_returning + total_prepare
 
-        # Форматируем числа
         def fmt_num(x):
             return f"{x:,}".replace(",", " ")
 
-        # Формируем текст сводки
         summary_text = (
             f"📊 <b>Сводка по остаткам Ozon</b>\n"
             f"Кабинет: <b>Озон {cabinet_id}</b>\n\n"
@@ -413,35 +360,33 @@ async def handle_report_type_choice(update: Update, context: CallbackContext) ->
             f"✅ <b>Итого на МП:</b> {fmt_num(total_mp)} шт"
         )
 
-        # ✅ Создаём Excel с форматированием
+        # ✅ Создаём Excel с двумя листами
         report_path = "Ozon_Remains_Report.xlsx"
-        create_formatted_excel(df, headers, report_path)
+        create_excel_with_two_sheets(df_raw, headers_raw, df_template, headers_template, report_path)
 
         # 📤 Отправляем файл
         await query.message.reply_document(
             document=open(report_path, 'rb'),
-            caption=f"📊 Отчёт по остаткам Ozon ({'исходные артикулы' if report_type == 'raw' else 'шаблон Nimba'})",
+            caption="📊 Отчёт по остаткам Ozon: два листа — исходные артикулы и шаблон Nimba",
             reply_markup=ReplyKeyboardRemove()
         )
 
-        # 💬 Отправляем сводку текстом
-        await query.message.reply_text(
-            summary_text,
-            parse_mode="HTML"
-        )
+        # 💬 Отправляем сводку
+        await query.message.reply_text(summary_text, parse_mode="HTML")
 
         # 🧹 Очистка
         if os.path.exists(report_path):
             os.remove(report_path)
 
     except Exception as e:
-        logger.error(f"Ошибка при генерации отчёта: {str(e)}", exc_info=True)
+        logger.error(f"Ошибка при получении данных: {str(e)}", exc_info=True)
         await query.message.reply_text(
             f"❌ Ошибка: {str(e)}",
             reply_markup=ReplyKeyboardRemove()
         )
 
     return ConversationHandler.END
+
 
 def group_ozon_remains_data(stock_data, art_to_id, id_to_name):
     """Группировка данных остатков Ozon по шаблону"""
@@ -479,13 +424,24 @@ def group_ozon_remains_data(stock_data, art_to_id, id_to_name):
     return grouped, unmatched
 
 
-def create_formatted_excel(df, headers, filename):
-    """Создаёт Excel с форматированием: жирные заголовки, автоподбор ширины, суммы, границы, выравнивание"""
+def create_excel_with_two_sheets(df_raw, headers_raw, df_template, headers_template, filename):
+    """Создаёт Excel с двумя листами: сначала 'Остатки шаблон Nimba', затем 'Остатки исходные артикулы'"""
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Остатки"
+    wb.remove(wb.active)  # удаляем дефолтный лист
 
-    # Стили
+    # Сначала — шаблон Nimba
+    ws1 = wb.create_sheet(title="Остатки шаблон Nimba")
+    _write_sheet(ws1, df_template, headers_template, has_name=False)
+
+    # Затем — исходные артикулы
+    ws2 = wb.create_sheet(title="Остатки исходные артикулы")
+    _write_sheet(ws2, df_raw, headers_raw, has_name=True)
+
+    wb.save(filename)
+
+
+def _write_sheet(ws, df, headers, has_name):
+    """Вспомогательная функция для записи одного листа с форматированием"""
     bold_font = Font(bold=True)
     center_alignment = Alignment(horizontal='center', vertical='center')
     thin_border = Border(
@@ -495,42 +451,33 @@ def create_formatted_excel(df, headers, filename):
         bottom=Side(style='thin')
     )
 
-    # Записываем заголовки
+    # Заголовки
     ws.append(headers)
-
-    # Жирный + выравнивание по центру для заголовков
     for col in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=col)
         cell.font = bold_font
         cell.alignment = center_alignment
         cell.border = thin_border
 
-    # Объединяем ячейки для столбца "Артикул" (A1:A2) — ВО ВСЕХ ОТЧЁТАХ
+    # Объединение ячеек в заголовке
     ws.merge_cells('A1:A2')
-
-    # Если есть "Наименование" — объединяем и B1:B2
-    if "Наименование" in headers:
+    if has_name:
         ws.merge_cells('B1:B2')
 
-    # Определяем, с какой строки начинаются данные
     data_start_row = 3
     sum_row = 2
 
-    # Записываем данные
+    # Данные
     for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=False), data_start_row):
         for c_idx, value in enumerate(row, 1):
             cell = ws.cell(row=r_idx, column=c_idx, value=value)
             cell.alignment = center_alignment
             cell.border = thin_border
 
-    # ✅ Добавляем суммы — ТОЛЬКО для числовых столбцов
+    # Суммы
     num_rows = len(df)
     if num_rows > 0:
-        # Определяем, с какого столбца начинать суммы:
-        # - Если есть "Наименование" → суммы с 3-го столбца (C)
-        # - Если нет → суммы с 2-го столбца (B)
-        start_col_index = 3 if "Наименование" in headers else 2
-
+        start_col_index = 3 if has_name else 2
         for col in range(start_col_index, len(headers) + 1):
             col_letter = get_column_letter(col)
             formula = f"=SUM({col_letter}{data_start_row}:{col_letter}{data_start_row + num_rows - 1})"
@@ -539,7 +486,7 @@ def create_formatted_excel(df, headers, filename):
             cell.alignment = center_alignment
             cell.border = thin_border
 
-    # Автоподбор ширины столбцов
+    # Автоподбор ширины
     for col in range(1, len(headers) + 1):
         max_length = 0
         column = get_column_letter(col)
@@ -551,5 +498,3 @@ def create_formatted_excel(df, headers, filename):
                 pass
         adjusted_width = min(max_length + 2, 50)
         ws.column_dimensions[column].width = adjusted_width
-
-    wb.save(filename)

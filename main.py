@@ -26,7 +26,7 @@ from states import (
     WB_REPORT_FILES,
     WB_REMAINS_FILES,
     OZON_REMAINS_CABINET_CHOICE,
-    OZON_REMAINS_REPORT_TYPE,
+    # OZON_REMAINS_REPORT_TYPE — УДАЛЕНО
     BARCODE_FILES,
     CSV_FILES,
     OZON_SALES_CABINET_CHOICE,
@@ -42,7 +42,7 @@ from handlers.wb_handler import (
 )
 from handlers.ozon_remains_handler import (
     start_ozon_remains,
-    handle_report_type_choice,
+    # handle_report_type_choice — УДАЛЕНО
     handle_cabinet_choice
 )
 from handlers.wb_remains_handler import (
@@ -153,22 +153,6 @@ async def select_action(update: Update, context: CallbackContext) -> int:
     return SELECTING_ACTION
 
 
-async def global_callback_handler(update: Update, context: CallbackContext):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data in ['raw', 'template']:
-        await handle_report_type_choice(update, context)
-    elif query.data in ['cabinet_1', 'cabinet_2']:
-        current_flow = context.user_data.get('current_flow', 'remains')
-        if current_flow == 'sales':
-            await handle_sales_cabinet_choice(update, context)
-        else:
-            await handle_cabinet_choice(update, context)
-    else:
-        await query.message.reply_text("Неизвестная команда")
-
-
 def main() -> None:
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
@@ -207,9 +191,7 @@ def main() -> None:
             OZON_REMAINS_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_cabinet_choice),
             ],
-            OZON_REMAINS_REPORT_TYPE: [
-                CallbackQueryHandler(handle_report_type_choice),
-            ],
+            # OZON_REMAINS_REPORT_TYPE — УДАЛЕНО
             BARCODE_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_barcode_files),
                 MessageHandler(filters.Text("Все файлы отправлены"), generate_barcode_report),
@@ -235,8 +217,6 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
-    # УДАЛЯЕМ глобальный CallbackQueryHandler!
-    # application.add_handler(CallbackQueryHandler(global_callback_handler))  # ← УДАЛЕНО
 
     logger.info("🚀 Бот запущен!")
     application.run_polling()

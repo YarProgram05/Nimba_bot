@@ -540,7 +540,6 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
     return ConversationHandler.END
 
-
 def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path,
                         total_orders, total_purchases, total_cancels, total_income,
                         raw_art_data=None):
@@ -548,6 +547,7 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     ws1 = wb.active
     ws1.title = "Сводный"
 
+    # === 1. Общая сводка ===
     headers1 = ["Показатель", "Значение"]
     ws1.append(headers1)
     for cell in ws1[1]:
@@ -565,7 +565,70 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     purchase_percent = (total_purchases / total_shipments * 100) if total_shipments > 0 else 0
     ws1.append(["Процент выкупов", f"{purchase_percent:.2f}%"])
 
-    # === Подробный (по шаблону) ===
+    # === 2. Разделитель ===
+    ws1.append([])  # пустая строка
+
+    # === 3. ТОП-5 артикулов по выкупам ===
+    if raw_art_data and len(raw_art_data) > 0:
+        top_5 = raw_art_data[:5]
+
+        # Заголовок
+        ws1.append(["🏆 ТОП-5 артикулов по выкупам"])
+        header_cell = ws1.cell(row=ws1.max_row, column=1)
+        header_cell.font = Font(bold=True, size=12)
+        header_cell.alignment = Alignment(horizontal="center")
+
+        # Пустая строка
+        ws1.append([])
+
+        # Заголовки таблицы
+        top_headers = ["Место", "Артикул", "Выкупы, шт", "Прибыль, ₽"]
+        ws1.append(top_headers)
+        for col in range(1, len(top_headers) + 1):
+            cell = ws1.cell(row=ws1.max_row, column=col)
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+
+        # Данные
+        for i, item in enumerate(top_5, 1):
+            ws1.append([
+                i,
+                item["art"],
+                item["purchases"],
+                item["profit"]
+            ])
+
+    # === 4. Форматирование всего листа ===
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+
+    # Применяем форматирование ко всем ячейкам с данными
+    for row in ws1.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                # Выравнивание по центру
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border = thin_border
+
+    # Автоподбор ширины для листа "Сводный"
+    for col in ws1.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 50)
+        ws1.column_dimensions[column].width = adjusted_width
+
+    # === 5. Остальные листы (без изменений) ===
+    # Подробный
     ws2 = wb.create_sheet(title="Подробный")
     headers2 = [
         "Наименование",
@@ -713,15 +776,8 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
                 percent_cell.fill = orange_fill
             row_idx += 1
 
-    # === Форматирование ===
-    thin_border = Border(
-        left=Side(style='thin'),
-        right=Side(style='thin'),
-        top=Side(style='thin'),
-        bottom=Side(style='thin')
-    )
-
-    for ws in wb.worksheets:
+    # === Форматирование остальных листов ===
+    for ws in [ws2, ws3] if raw_art_data else [ws2]:
         for row in ws.iter_rows():
             for cell in row:
                 if cell.value is not None:

@@ -14,6 +14,7 @@ from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import CallbackContext, ConversationHandler
 import logging
 
+from states import BARCODE_FILES
 # Попробуем импортировать code128
 try:
     import code128
@@ -300,7 +301,7 @@ async def start_barcode_generation(update: Update, context: CallbackContext) -> 
         reply_markup=reply_markup
     )
 
-    return 5  # Состояние ожидания файлов штрихкодов
+    return BARCODE_FILES  # Состояние ожидания файлов штрихкодов
 
 
 async def handle_barcode_files(update: Update, context: CallbackContext) -> int:
@@ -312,7 +313,7 @@ async def handle_barcode_files(update: Update, context: CallbackContext) -> int:
     # Проверка типа файла
     if not file_name.lower().endswith('.xlsx'):
         await update.message.reply_text("❌ Файл должен быть в формате Excel (.xlsx)")
-        return 5
+        return BARCODE_FILES
 
     # Скачивание файла
     file = await context.bot.get_file(document)
@@ -323,7 +324,7 @@ async def handle_barcode_files(update: Update, context: CallbackContext) -> int:
     user_data.setdefault('barcode_files', []).append(file_path)
     await update.message.reply_text(f"✅ Файл '{file_name}' получен")
 
-    return 5
+    return BARCODE_FILES
 
 
 async def generate_barcode_report(update: Update, context: CallbackContext) -> int:
