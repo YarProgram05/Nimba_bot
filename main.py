@@ -13,6 +13,9 @@ from telegram.ext import (
     filters
 )
 from dotenv import load_dotenv
+import datetime
+from datetime import time as tm
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 # Подавляем warning о per_message=False
 warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*per_message=False.*")
@@ -26,7 +29,6 @@ from states import (
     WB_REPORT_FILES,
     WB_REMAINS_FILES,
     OZON_REMAINS_CABINET_CHOICE,
-    # OZON_REMAINS_REPORT_TYPE — УДАЛЕНО
     BARCODE_FILES,
     CSV_FILES,
     OZON_SALES_CABINET_CHOICE,
@@ -42,8 +44,8 @@ from handlers.wb_handler import (
 )
 from handlers.ozon_remains_handler import (
     start_ozon_remains,
-    # handle_report_type_choice — УДАЛЕНО
-    handle_cabinet_choice
+    handle_cabinet_choice,
+    send_ozon_remains_automatic
 )
 from handlers.wb_remains_handler import (
     start_wb_remains,
@@ -74,6 +76,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def get_next_monday_10am(tz):
+    """Возвращает datetime ближайшего понедельника в 10:00 по указанному часовому поясу"""
+    now = datetime.datetime.now(tz)
+    days_ahead = (0 - now.weekday()) % 7  # 0 = понедельник
+    next_monday = now.replace(hour=20, minute=15, second=0, microsecond=0) + datetime.timedelta(days=days_ahead)
+
+    # Если сегодня понедельник, но уже после 10:00 — берём следующий понедельник
+    if days_ahead == 0 and now.time() > datetime.time(20, 15):
+        next_monday += datetime.timedelta(weeks=1)
+
+    return next_monday
 
 def get_main_menu():
     """Возвращает главное меню с кнопками"""
@@ -110,6 +123,7 @@ def cleanup_user_data(context: CallbackContext):
 
 async def start(update: Update, context: CallbackContext) -> int:
     cleanup_user_data(context)
+    # print("Ваш chat_id:", update.effective_chat.id)
     welcome_text = (
         "🔄 Бот сброшен. Добро пожаловать!\n\n"
         "Я помогу вам:\n"
@@ -160,6 +174,29 @@ def main() -> None:
 
     application = Application.builder().token(bot_token).build()
 
+    # === 🗓️ ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ: КАЖДЫЙ ПОНЕДЕЛЬНИК В 10:00 ПО МОСКВЕ ===
+    YOUR_CHAT_ID = 726413418  # ← ваш ID
+    moscow_tz = ZoneInfo("Europe/Moscow")
+
+    next_run = get_next_monday_10am(moscow_tz)
+    first_run_seconds = (next_run - datetime.datetime.now(moscow_tz)).total_seconds()
+
+    # Кабинет 1
+    application.job_queue.run_repeating(
+        callback=send_ozon_remains_automatic,
+        interval=7 * 24 * 60 * 60,  # 7 дней в секундах
+        first=first_run_seconds,
+        data={'chat_id': YOUR_CHAT_ID, 'cabinet_id': 1}
+    )
+
+    # Кабинет 2 (на 1 минуту позже)
+    application.job_queue.run_repeating(
+        callback=send_ozon_remains_automatic,
+        interval=7 * 24 * 60 * 60,
+        first=first_run_seconds + 60,
+        data={'chat_id': YOUR_CHAT_ID, 'cabinet_id': 2}
+    )
+
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
@@ -191,7 +228,6 @@ def main() -> None:
             OZON_REMAINS_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_cabinet_choice),
             ],
-            # OZON_REMAINS_REPORT_TYPE — УДАЛЕНО
             BARCODE_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_barcode_files),
                 MessageHandler(filters.Text("Все файлы отправлены"), generate_barcode_report),
