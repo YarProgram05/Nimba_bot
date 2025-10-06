@@ -2,7 +2,7 @@ name: Deploy Nimba Bot
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
 
 jobs:
   deploy:
