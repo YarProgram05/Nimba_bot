@@ -1,5 +1,5 @@
-name: Deploy Nimba Bot
-# Deploy test — 2025-10-06
+name: Deploy to Timeweb
+
 on:
   push:
     branches: [ master ]
@@ -8,15 +8,14 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy to SpiritHost
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: 141.8.192.186
-          username: a1176407
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          host: 77.95.206.171
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
-            cd /home/a1176407/bot
-            pkill -f "python3 main.py" 2>/dev/null || true
-            git pull origin master 
-            pip3 install -r requirements.txt --user
-            nohup python3 main.py > bot.log 2>&1 &
+            cd /root/Nimba_bot
+            git pull origin master
+            pip3 install -r requirements.txt
+            systemctl restart nimba-bot
