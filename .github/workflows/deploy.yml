@@ -11,7 +11,7 @@ jobs:
       - name: Deploy to SpiritHost
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: 109.252.36.18
+          host: 141.8.192.186
           username: a1176407
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
