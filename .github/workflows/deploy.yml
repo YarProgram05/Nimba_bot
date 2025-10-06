@@ -1,5 +1,5 @@
 name: Deploy Nimba Bot
-# Deploy test — 2025-10-06
+
 on:
   push:
     branches: [ master ]
@@ -11,7 +11,7 @@ jobs:
       - name: Deploy to SpiritHost
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: rig.spirit-host.ru
+          host: 141.8.192.186
           username: a1176407
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
