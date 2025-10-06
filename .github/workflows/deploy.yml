@@ -1,5 +1,5 @@
 name: Deploy Nimba Bot
-
+# Deploy test — 2025-10-06
 on:
   push:
     branches: [ master ]
