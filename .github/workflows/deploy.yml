@@ -20,8 +20,8 @@ jobs:
             pkill -f "python3 main.py" 2>/dev/null || true
 
             echo "📥 Обновляем код..."
-            git fetch origin main
-            git reset --hard origin/main
+            git fetch origin master
+            git reset --hard origin/master
 
             echo "📦 Устанавливаем зависимости..."
             pip3 install -r requirements.txt --user
