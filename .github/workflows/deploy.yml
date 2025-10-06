@@ -1,0 +1,28 @@
+name: Deploy Nimba Bot
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to SpiritHost
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: rig.spirit-host.ru
+          username: a1176407
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/a1176407/bot
+
+            # Остановить старый процесс (если есть)
+            pkill -f "python3 main.py" 2>/dev/null || true
+
+            # Обновить код
+            git pull origin main
+            pip3 install -r requirements.txt --user
+
+            # Запустить новый процесс в фоне
+            nohup python3 main.py > bot.log 2>&1 &
