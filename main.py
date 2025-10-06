@@ -79,11 +79,11 @@ logger = logging.getLogger(__name__)
 def get_next_monday_10am(tz):
     """Возвращает datetime ближайшего понедельника в 10:00 по указанному часовому поясу"""
     now = datetime.datetime.now(tz)
-    days_ahead = (1 - now.weekday()) % 7  # 0 = понедельник
-    next_monday = now.replace(hour=1, minute=15, second=0, microsecond=0) + datetime.timedelta(days=days_ahead)
+    days_ahead = (0 - now.weekday()) % 7  # 0 = понедельник
+    next_monday = now.replace(hour=10, minute=0, second=0, microsecond=0) + datetime.timedelta(days=days_ahead)
 
     # Если сегодня понедельник, но уже после 10:00 — берём следующий понедельник
-    if days_ahead == 0 and now.time() > datetime.time(1, 15):
+    if days_ahead == 0 and now.time() > datetime.time(10, 0):
         next_monday += datetime.timedelta(weeks=1)
 
     return next_monday
