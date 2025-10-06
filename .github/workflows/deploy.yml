@@ -16,17 +16,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd /home/a1176407/bot
-            echo "🔄 Останавливаем старый процесс..."
             pkill -f "python3 main.py" 2>/dev/null || true
-
-            echo "📥 Обновляем код..."
-            git fetch origin master
-            git reset --hard origin/master
-
-            echo "📦 Устанавливаем зависимости..."
+            git pull origin master 
             pip3 install -r requirements.txt --user
-
-            echo "🚀 Запускаем бота..."
             nohup python3 main.py > bot.log 2>&1 &
-            sleep 2
-            echo "✅ Деплой завершён"
