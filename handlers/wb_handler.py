@@ -1,94 +1,138 @@
+# handlers/wb_handler.py
+
 import sys
 import os
+import pandas as pd
+import logging
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from telegram.ext import CallbackContext, ConversationHandler
 
-# Добавляем путь к utils
+# Настройка путей
 utils_path = os.path.join(os.path.dirname(__file__), '..', 'utils')
 if utils_path not in sys.path:
     sys.path.append(utils_path)
 
-from template_loader import load_template
-from excel_utils import create_report
+# Импорты из utils
+from utils.template_loader import get_cabinet_articles_by_template_id
+from utils.excel_utils import create_report
 
-import pandas as pd
-import logging
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from telegram.ext import CallbackContext, ConversationHandler, filters
-from states import WB_REPORT_FILES
+from states import WB_REPORT_CABINET_CHOICE, WB_REPORT_FILES
 
 logger = logging.getLogger(__name__)
 
 
+# === ШАГ 1: ВЫБОР КАБИНЕТА ===
 async def start_wb_report(update: Update, context: CallbackContext) -> int:
-    """Начало обработки отчета Wildberries (ПРОДАЖИ)"""
-    context.user_data['wb_files'] = []
-
-    # Создание клавиатуры
-    buttons = [["Все файлы отправлены"]]
-    reply_markup = ReplyKeyboardMarkup(
-        buttons,
-        resize_keyboard=True,
-        one_time_keyboard=False  # Клавиатура остаётся, чтобы было удобно
-    )
+    """Начало — выбор кабинета WB для отчёта по продажам"""
+    keyboard = [
+        [InlineKeyboardButton("🏪 WB Nimba (Кабинет 1)", callback_data='wb_sales_cabinet_1')],
+        [InlineKeyboardButton("🏬 WB Galioni (Кабинет 2)", callback_data='wb_sales_cabinet_2')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
+        "🏢 Выберите кабинет Wildberries для отчёта по продажам:",
+        reply_markup=reply_markup
+    )
+    return WB_REPORT_CABINET_CHOICE
+
+
+# === ШАГ 2: ОБРАБОТКА ВЫБОРА ===
+async def handle_wb_sales_cabinet_choice(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == 'wb_sales_cabinet_1':
+        cabinet_name = "WB Nimba"
+        sheet_name = "Отдельно ВБ Nimba"
+    elif query.data == 'wb_sales_cabinet_2':
+        cabinet_name = "WB Galioni"
+        sheet_name = "Отдельно ВБ Galioni"
+    else:
+        await query.message.reply_text("❌ Неизвестный кабинет.")
+        return ConversationHandler.END
+
+    context.user_data['wb_sales_cabinet'] = cabinet_name
+    context.user_data['wb_sales_sheet'] = sheet_name
+
+    await query.message.edit_text(f"✅ Выбран кабинет: {cabinet_name}")
+
+    # Клавиатура для отправки файла
+    buttons = [["Все файлы отправлены"]]
+    reply_markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+
+    await query.message.reply_text(
         "📤 Пожалуйста, отправьте файл продаж Wildberries:\n\n"
         "📎 Название файла должно содержать 'продажи' (например, 'ВБ_продажи.xlsx')\n\n"
         "После отправки всех файлов нажмите кнопку ниже ⬇️",
         reply_markup=reply_markup
     )
 
+    context.user_data['wb_files'] = []
     return WB_REPORT_FILES
 
 
+# === ШАГ 3: ПРИЁМ ФАЙЛОВ ===
 async def handle_wb_files(update: Update, context: CallbackContext) -> int:
-    """Обработка файлов Wildberries (ПРОДАЖИ)"""
-    user_data = context.user_data
     document = update.message.document
     file_name = document.file_name
 
-    # Проверка типа файла
     if not file_name.lower().endswith('.xlsx'):
         await update.message.reply_text("❌ Файл должен быть в формате Excel (.xlsx)")
         return WB_REPORT_FILES
 
-    # Скачивание файла
     file = await context.bot.get_file(document)
     file_path = f"temp_{file_name}"
     await file.download_to_drive(file_path)
 
-    # Сохранение файла
-    user_data.setdefault('wb_files', []).append(file_path)
+    context.user_data.setdefault('wb_files', []).append(file_path)
 
-    # Уточняем: это файл ПРОДАЖ
     await update.message.reply_text(
-        f"✅ Файл продаж Wildberries '{file_name}' получен.\n"
+        f"✅ Файл продаж '{file_name}' получен для {context.user_data['wb_sales_cabinet']}.\n"
         "Нажмите «Все файлы отправлены», если готовы сформировать отчёт.",
         reply_markup=ReplyKeyboardMarkup([["Все файлы отправлены"]], resize_keyboard=True)
     )
-
     return WB_REPORT_FILES
 
 
+# === ШАГ 4: ГЕНЕРАЦИЯ ОТЧЁТА ===
 async def generate_wb_report(update: Update, context: CallbackContext) -> int:
-    """Генерация отчета Wildberries (ПРОДАЖИ)"""
-    logger.info("Вызвана generate_wb_report для продаж WB")
-    logger.info(f"Получено сообщение: '{update.message.text}'")
-
     user_data = context.user_data
     wb_files = user_data.get('wb_files', [])
+    sheet_name = user_data.get('wb_sales_sheet')
 
-    if not wb_files:
-        await update.message.reply_text(
-            "❌ Не получены файлы для формирования отчета!",
-            reply_markup=ReplyKeyboardRemove()
-        )
+    if not wb_files or not sheet_name:
+        await update.message.reply_text("❌ Данные повреждены. Начните сначала.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
     try:
         await update.message.reply_text("⏳ Обрабатываю файлы продаж Wildberries...")
 
-        # Загрузка шаблона
-        art_to_id, id_to_name, main_ids_ordered = load_template("Шаблон_WB")
+        # Загрузка шаблона с использованием нового template_loader
+        template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id(sheet_name)
+
+        # Получаем main_ids_ordered — ID в порядке появления в Excel (без дубликатов)
+        template_path = os.path.join(os.path.dirname(__file__), '..', "База данных артикулов для выкупов и начислений.xlsx")
+        if not os.path.exists(template_path):
+            template_path = "База данных артикулов для выкупов и начислений.xlsx"
+        df_order = pd.read_excel(template_path, sheet_name=sheet_name)
+        main_ids_ordered = []
+        seen = set()
+        for _, row in df_order.iterrows():
+            if not pd.isna(row.get('ID')):
+                tid = int(row['ID'])
+                if tid not in seen:
+                    main_ids_ordered.append(tid)
+                    seen.add(tid)
+
+        # Построение art_to_id из template_id_to_cabinet_arts
+        art_to_id = {}
+        for template_id, cabinet_arts in template_id_to_cabinet_arts.items():
+            for art in cabinet_arts:
+                clean_art = str(art).strip().lower()
+                art_to_id[clean_art] = template_id
+
+        id_to_name = template_id_to_name
 
         # Обработка файлов
         all_purchases = {}
@@ -97,15 +141,13 @@ async def generate_wb_report(update: Update, context: CallbackContext) -> int:
 
         for file_path in wb_files:
             purchases, cancels, income = process_wb_sales(file_path)
-
             for art in purchases:
                 all_purchases[art] = all_purchases.get(art, 0) + purchases[art]
                 all_income[art] = all_income.get(art, 0) + income.get(art, 0)
-
             for art in cancels:
                 all_cancels[art] = all_cancels.get(art, 0) + cancels[art]
 
-        # Группировка данных
+        # Группировка данных (как в старом файле)
         grouped, unmatched = group_wb_data(
             all_purchases,
             all_cancels,
@@ -114,8 +156,8 @@ async def generate_wb_report(update: Update, context: CallbackContext) -> int:
             id_to_name
         )
 
-        # Создание отчета
-        report_path = "WB_Report.xlsx"
+        # Создание отчета с использованием старого excel_utils.create_report
+        report_path = f"WB_Report_{sheet_name.replace(' ', '_')}.xlsx"
         create_report(
             grouped,
             unmatched,
@@ -124,29 +166,25 @@ async def generate_wb_report(update: Update, context: CallbackContext) -> int:
             report_path
         )
 
-        # Отправка отчета
         await update.message.reply_document(
             document=open(report_path, 'rb'),
-            caption="📊 Отчет по продажам Wildberries",
+            caption=f"📊 Отчет по продажам Wildberries\nКабинет: {user_data['wb_sales_cabinet']}",
             reply_markup=ReplyKeyboardRemove()
         )
 
-        # Очистка временных файлов
-        for file_path in wb_files:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        if os.path.exists(report_path):
-            os.remove(report_path)
+        # Очистка
+        for fp in wb_files + [report_path]:
+            if os.path.exists(fp):
+                os.remove(fp)
 
     except Exception as e:
-        logger.error(f"Ошибка обработки Wildberries: {str(e)}", exc_info=True)
-        await update.message.reply_text(
-            f"❌ Ошибка при обработке файлов Wildberries: {str(e)}",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        logger.error(f"Ошибка обработки WB продаж: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}", reply_markup=ReplyKeyboardRemove())
 
     return ConversationHandler.END
 
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (как в старом файле) ===
 
 def process_wb_sales(file_path):
     """Обработка файла продаж Wildberries"""

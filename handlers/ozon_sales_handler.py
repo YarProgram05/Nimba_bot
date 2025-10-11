@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 import asyncio
+import pandas as pd
 from datetime import datetime, timezone, timedelta
 import requests
 import time
@@ -25,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 # Состояния
 from states import OZON_SALES_CABINET_CHOICE, OZON_SALES_DATE_START, OZON_SALES_DATE_END
+
+# Импорт новой функции из template_loader
+from utils.template_loader import get_cabinet_articles_by_template_id
 
 
 def split_by_max_period(start: datetime, end: datetime, max_days: int):
@@ -135,6 +139,7 @@ def validate_date_format(text: str) -> bool:
     import re
     return bool(re.fullmatch(r'\d{2}\.\d{2}\.\d{4}', text.strip()))
 
+
 def split_by_calendar_months(start_dt: datetime, end_dt: datetime):
     """
     Разбивает диапазон на чанки по календарным месяцам.
@@ -160,6 +165,7 @@ def split_by_calendar_months(start_dt: datetime, end_dt: datetime):
         current_start = next_month
 
     return chunks
+
 
 async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
     context.user_data['current_flow'] = 'sales'
@@ -396,12 +402,32 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         total_income = sum(income.values())
 
         # === Загрузка шаблона ===
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("template_loader", os.path.join(utils_dir, "template_loader.py"))
-        template_loader = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(template_loader)
+        sheet_name = "Отдельно Озон Nimba" if cabinet_id == 1 else "Отдельно Озон Galioni"
 
-        art_to_id, id_to_name, main_ids_ordered = template_loader.load_template("Шаблон_Ozon")
+        template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id(sheet_name)
+
+        # Получаем main_ids_ordered — ID в порядке появления в Excel (без дубликатов)
+        template_path = os.path.join(root_dir, "База данных артикулов для выкупов и начислений.xlsx")
+        if not os.path.exists(template_path):
+            template_path = "База данных артикулов для выкупов и начислений.xlsx"
+        df_order = pd.read_excel(template_path, sheet_name=sheet_name)
+        main_ids_ordered = []
+        seen = set()
+        for _, row in df_order.iterrows():
+            if not pd.isna(row.get('ID')):
+                tid = int(row['ID'])
+                if tid not in seen:
+                    main_ids_ordered.append(tid)
+                    seen.add(tid)
+
+        # Построение art_to_id из template_id_to_cabinet_arts
+        art_to_id = {}
+        for template_id, cabinet_arts in template_id_to_cabinet_arts.items():
+            for art in cabinet_arts:
+                clean_art = str(art).strip().lower()
+                art_to_id[clean_art] = template_id
+
+        id_to_name = template_id_to_name
 
         # === Группировка по шаблону ===
         grouped = {}
@@ -539,6 +565,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         )
 
     return ConversationHandler.END
+
 
 def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path,
                         total_orders, total_purchases, total_cancels, total_income,

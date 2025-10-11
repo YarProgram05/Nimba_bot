@@ -1,3 +1,5 @@
+# utils/template_loader.py
+
 import pandas as pd
 import logging
 import os
@@ -5,7 +7,17 @@ import os
 logger = logging.getLogger(__name__)
 
 
-def load_template(sheet_name):
+def get_cabinet_articles_by_template_id(sheet_name):
+    """
+    Возвращает:
+      - template_id_to_name: { template_id: "Шаблонное название" }
+      - template_id_to_cabinet_arts: { template_id: [real_art1, real_art2, ...] }
+
+    Логика:
+      - Все строки с ID → определяют шаблонные артикулы.
+      - Все строки с ID_mix → привязывают Articles_cabinet к template_id = ID_mix,
+        даже если нет отдельной строки с ID = ID_mix (но тогда название = "ID {X}")
+    """
     try:
         template_path = "База данных артикулов для выкупов и начислений.xlsx"
         if not os.path.exists(template_path):
@@ -14,67 +26,41 @@ def load_template(sheet_name):
 
         df = pd.read_excel(template_path, sheet_name=sheet_name)
 
-        # Создаем словари для соответствий
-        art_to_id = {}
-        id_to_name = {}
-        main_ids_ordered = []
+        template_id_to_name = {}
+        template_id_to_cabinet_arts = {}
 
-        # Обработка основных строк с ID и Articles
+        # Шаг 1: собрать все ID → Articles
         for _, row in df.iterrows():
             if not pd.isna(row.get('ID')):
-                id_val = int(row['ID'])
-                article_name = row['Articles']
-                id_to_name[id_val] = article_name
-                main_ids_ordered.append(id_val)
+                template_id = int(row['ID'])
+                article_name = str(row['Articles']).strip()
+                template_id_to_name[template_id] = article_name
 
-                # Добавляем основное название
-                art_str = str(article_name).strip().lower()
-                art_to_id[art_str] = id_val
-
-        # Обработка строк с Mixed_Articles
+        # Шаг 2: собрать все ID_mix → Articles_cabinet
         for _, row in df.iterrows():
-            if not pd.isna(row.get('ID_mix')) and not pd.isna(row.get('Mixed_Articles')):
-                id_mix_val = int(row['ID_mix'])
-                mixed_art = str(row['Mixed_Articles']).strip().lower()
+            id_mix = None
+            cabinet_art = None
 
-                # Связываем с основным ID
-                art_to_id[mixed_art] = id_mix_val
+            # Используем ID_mix, если есть
+            if not pd.isna(row.get('ID_mix')):
+                id_mix = int(row['ID_mix'])
 
-                # Если ID_mix нет в основных, добавляем
-                if id_mix_val not in id_to_name:
-                    id_to_name[id_mix_val] = mixed_art
-                    main_ids_ordered.append(id_mix_val)
+            # ИЛИ, если нет ID_mix, но есть ID и Articles_cabinet — используем ID
+            elif not pd.isna(row.get('ID')) and not pd.isna(row.get('Articles_cabinet')):
+                id_mix = int(row['ID'])
 
-        return art_to_id, id_to_name, main_ids_ordered
+            if id_mix is not None:
+                cabinet_art = str(row.get('Articles_cabinet', '')).strip()
+
+            if id_mix is not None and cabinet_art:
+                # Гарантируем, что template_id_to_name содержит запись
+                if id_mix not in template_id_to_name:
+                    template_id_to_name[id_mix] = f"ID {id_mix}"
+
+                template_id_to_cabinet_arts.setdefault(id_mix, []).append(cabinet_art)
+
+        return template_id_to_name, template_id_to_cabinet_arts
 
     except Exception as e:
-        logger.error(f"Ошибка при загрузке шаблона: {e}")
-        return {}, {}, []
-
-
-def get_article_mapping(sheet_name):
-    """Получаем отображение артикулов из шаблона"""
-    try:
-        template_path = "База данных артикулов для выкупов и начислений.xlsx"
-        if not os.path.exists(template_path):
-            template_path = os.path.join(os.path.dirname(__file__), "..",
-                                         "База данных артикулов для выкупов и начислений.xlsx")
-
-        df = pd.read_excel(template_path, sheet_name=sheet_name)
-
-        mapping = {}
-
-        # Обработка строк
-        for _, row in df.iterrows():
-            if not pd.isna(row.get('ID')) and not pd.isna(row.get('Articles')):
-                article_name = str(row['Articles']).strip().lower()
-                mapping[article_name] = int(row['ID'])
-
-            if not pd.isna(row.get('ID_mix')) and not pd.isna(row.get('Mixed_Articles')):
-                mixed_art = str(row['Mixed_Articles']).strip().lower()
-                mapping[mixed_art] = int(row['ID_mix'])
-
-        return mapping
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке маппинга артикулов: {e}")
-        return {}
+        logger.error(f"Ошибка в get_cabinet_articles_by_template_id для листа {sheet_name}: {e}")
+        return {}, {}

@@ -23,7 +23,11 @@ if utils_dir not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-from states import OZON_REMAINS_CABINET_CHOICE  # Убрано OZON_REMAINS_REPORT_TYPE
+from states import OZON_REMAINS_CABINET_CHOICE
+
+# Импорт новой функции из template_loader
+from utils.template_loader import get_cabinet_articles_by_template_id
+
 
 # ======================
 # Ozon API Класс
@@ -127,6 +131,70 @@ def chunk_list(lst, n):
 
 
 # ======================
+# Нормализация и группировка
+# ======================
+
+def normalize_art(art_str):
+    """Нормализует строку: приводит к нижнему регистру, удаляет лишние пробелы, очищает от невидимых символов"""
+    if not art_str:
+        return ""
+    s = str(art_str)
+    s = ''.join(c for c in s if c.isprintable())
+    s = s.strip().lower()
+    return s
+
+
+def group_ozon_remains_data(stock_data, template_id_to_cabinet_arts, template_id_to_name):
+    """
+    Группирует данные остатков по шаблонным артикулам.
+
+    :param stock_data: dict {offer_id: {"available": ..., "returning": ..., "prepare": ...}}
+    :param template_id_to_cabinet_arts: dict {template_id: [cabinet_art1, cabinet_art2, ...]}
+    :param template_id_to_name: dict {template_id: "Шаблонное название"}
+    :return: grouped (по template_id), unmatched (артикулы без привязки)
+    """
+    stock_data_clean = {}
+    for art, data in stock_data.items():
+        clean_art = normalize_art(art)
+        if clean_art:
+            stock_data_clean[clean_art] = data
+
+    cabinet_art_to_template_id = {}
+    for template_id, arts in template_id_to_cabinet_arts.items():
+        for art in arts:
+            clean_art = normalize_art(art)
+            if clean_art:
+                cabinet_art_to_template_id[clean_art] = template_id
+
+    grouped = {}
+    unmatched = {}
+
+    for clean_art, data in stock_data_clean.items():
+        template_id = cabinet_art_to_template_id.get(clean_art)
+
+        if template_id is not None:
+            if template_id not in grouped:
+                grouped[template_id] = {
+                    'name': template_id_to_name.get(template_id, f"ID {template_id}"),
+                    'available': 0,
+                    'returning': 0,
+                    'prepare': 0
+                }
+            grouped[template_id]['available'] += data['available']
+            grouped[template_id]['returning'] += data['returning']
+            grouped[template_id]['prepare'] += data['prepare']
+        else:
+            unmatched[clean_art] = {
+                'name': f"НЕОПОЗНАННЫЙ: {clean_art}",
+                'available': data['available'],
+                'returning': data['returning'],
+                'prepare': data['prepare']
+            }
+
+    return grouped, unmatched
+
+
+# ======================
 # Обработчики
 # ======================
 
@@ -219,7 +287,8 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
 
                 if offer_id in stock_dict:
                     stock_dict[offer_id]['available_stock_count'] += item.get('available_stock_count', 0)
-                    stock_dict[offer_id]['return_from_customer_stock_count'] += item.get('return_from_customer_stock_count', 0)
+                    stock_dict[offer_id]['return_from_customer_stock_count'] += item.get(
+                        'return_from_customer_stock_count', 0)
                     stock_dict[offer_id]['other_stock_count'] += item.get('other_stock_count', 0)
                 else:
                     stock_dict[offer_id] = {
@@ -280,23 +349,31 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                 'Итого на МП': total
             })
 
-        df_raw = pd.DataFrame(raw_data).sort_values(by='Наименование', key=lambda x: x.str.lower()).reset_index(drop=True)
-        headers_raw = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже", "Итого на МП"]
+        df_raw = pd.DataFrame(raw_data).sort_values(by='Наименование', key=lambda x: x.str.lower()).reset_index(
+            drop=True)
+        headers_raw = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                       "Подготовка к продаже", "Итого на МП"]
 
-        # === 2. Отчёт по шаблону Nimba ===
+        # === 2. Отчёт по шаблону Nimba/Galioni ===
+        sheet_name = "Отдельно Озон Nimba" if cabinet_id == 1 else "Отдельно Озон Galioni"
+
+        template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id(sheet_name)
+
+        # Получаем main_ids_ordered — ID в порядке появления в Excel (без дубликатов)
         template_path = os.path.join(root_dir, "База данных артикулов для выкупов и начислений.xlsx")
         if not os.path.exists(template_path):
             template_path = "База данных артикулов для выкупов и начислений.xlsx"
-        if not os.path.exists(template_path):
-            raise Exception("Файл шаблона не найден!")
+        df_order = pd.read_excel(template_path, sheet_name=sheet_name)
+        main_ids_ordered = []
+        seen = set()
+        for _, row in df_order.iterrows():
+            if not pd.isna(row.get('ID')):
+                tid = int(row['ID'])
+                if tid not in seen:
+                    main_ids_ordered.append(tid)
+                    seen.add(tid)
 
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("template_loader", os.path.join(utils_dir, "template_loader.py"))
-        template_loader = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(template_loader)
-
-        art_to_id, id_to_name, main_ids_ordered = template_loader.load_template("Шаблон_Ozon")
-
+        # Подготовка stock_data
         stock_data = {}
         for offer_id, data in stock_dict.items():
             stock_data[offer_id] = {
@@ -305,7 +382,12 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                 "prepare": data['other_stock_count']
             }
 
-        grouped, unmatched = group_ozon_remains_data(stock_data, art_to_id, id_to_name)
+        # Группировка по шаблонам
+        grouped, unmatched = group_ozon_remains_data(
+            stock_data,
+            template_id_to_cabinet_arts,
+            template_id_to_name
+        )
 
         template_data = []
         for id_val in main_ids_ordered:
@@ -320,7 +402,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                     'Итого на МП': total
                 })
             else:
-                name = id_to_name.get(id_val, f"ID {id_val}")
+                name = template_id_to_name.get(id_val, f"ID {id_val}")
                 template_data.append({
                     'Артикул': name,
                     'Доступно на складах': 0,
@@ -340,7 +422,8 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
             })
 
         df_template = pd.DataFrame(template_data)
-        headers_template = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже", "Итого на МП"]
+        headers_template = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже",
+                            "Итого на МП"]
 
         # === Сводка по всем остаткам ===
         total_available = sum(data['available_stock_count'] for data in stock_dict.values())
@@ -367,7 +450,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
         # 📤 Отправляем файл
         await query.message.reply_document(
             document=open(report_path, 'rb'),
-            caption="📊 Отчёт по остаткам Ozon: два листа — исходные артикулы и шаблон Nimba",
+            caption="📊 Отчёт по остаткам Ozon: два листа — исходные артикулы и шаблон Nimba/Galioni",
             reply_markup=ReplyKeyboardRemove()
         )
 
@@ -388,48 +471,12 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
     return ConversationHandler.END
 
 
-def group_ozon_remains_data(stock_data, art_to_id, id_to_name):
-    """Группировка данных остатков Ozon по шаблону"""
-    all_arts = set(stock_data.keys())
-
-    grouped = {}
-    unmatched = {}
-
-    for art in all_arts:
-        art_clean = str(art).strip().lower()
-        group_id = art_to_id.get(art_clean, None)
-
-        if group_id is not None:
-            group_name = id_to_name.get(group_id, art)
-
-            if group_id not in grouped:
-                grouped[group_id] = {
-                    'name': group_name,
-                    'available': 0,
-                    'returning': 0,
-                    'prepare': 0
-                }
-
-            grouped[group_id]['available'] += stock_data[art]["available"]
-            grouped[group_id]['returning'] += stock_data[art]["returning"]
-            grouped[group_id]['prepare'] += stock_data[art]["prepare"]
-        else:
-            unmatched[art] = {
-                'name': f"НЕОПОЗНАННЫЙ: {art}",
-                'available': stock_data[art]["available"],
-                'returning': stock_data[art]["returning"],
-                'prepare': stock_data[art]["prepare"]
-            }
-
-    return grouped, unmatched
-
-
 def create_excel_with_two_sheets(df_raw, headers_raw, df_template, headers_template, filename):
     """Создаёт Excel с двумя листами: сначала 'Остатки шаблон Nimba', затем 'Остатки исходные артикулы'"""
     wb = Workbook()
     wb.remove(wb.active)  # удаляем дефолтный лист
 
-    # Сначала — шаблон Nimba
+    # Сначала — шаблон Nimba/Galioni
     ws1 = wb.create_sheet(title="Остатки шаблон Nimba")
     _write_sheet(ws1, df_template, headers_template, has_name=False)
 
@@ -498,6 +545,7 @@ def _write_sheet(ws, df, headers, has_name):
                 pass
         adjusted_width = min(max_length + 2, 50)
         ws.column_dimensions[column].width = adjusted_width
+
 
 # ======================
 # Автоматическая отправка отчёта (для job_queue)
@@ -568,7 +616,8 @@ async def send_ozon_remains_automatic(context: CallbackContext):
 
                 if offer_id in stock_dict:
                     stock_dict[offer_id]['available_stock_count'] += item.get('available_stock_count', 0)
-                    stock_dict[offer_id]['return_from_customer_stock_count'] += item.get('return_from_customer_stock_count', 0)
+                    stock_dict[offer_id]['return_from_customer_stock_count'] += item.get(
+                        'return_from_customer_stock_count', 0)
                     stock_dict[offer_id]['other_stock_count'] += item.get('other_stock_count', 0)
                 else:
                     stock_dict[offer_id] = {
@@ -629,22 +678,29 @@ async def send_ozon_remains_automatic(context: CallbackContext):
                 'Итого на МП': total
             })
 
-        df_raw = pd.DataFrame(raw_data).sort_values(by='Наименование', key=lambda x: x.str.lower()).reset_index(drop=True)
-        headers_raw = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже", "Итого на МП"]
+        df_raw = pd.DataFrame(raw_data).sort_values(by='Наименование', key=lambda x: x.str.lower()).reset_index(
+            drop=True)
+        headers_raw = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                       "Подготовка к продаже", "Итого на МП"]
 
-        # === Шаблон Nimba ===
+        # === Шаблон Nimba/Galioni ===
+        sheet_name = "Отдельно Озон Nimba" if cabinet_id == 1 else "Отдельно Озон Galioni"
+
+        template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id(sheet_name)
+
+        # Получаем main_ids_ordered
         template_path = os.path.join(root_dir, "База данных артикулов для выкупов и начислений.xlsx")
         if not os.path.exists(template_path):
             template_path = "База данных артикулов для выкупов и начислений.xlsx"
-        if not os.path.exists(template_path):
-            raise Exception("Файл шаблона не найден!")
-
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("template_loader", os.path.join(utils_dir, "template_loader.py"))
-        template_loader = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(template_loader)
-
-        art_to_id, id_to_name, main_ids_ordered = template_loader.load_template("Шаблон_Ozon")
+        df_order = pd.read_excel(template_path, sheet_name=sheet_name)
+        main_ids_ordered = []
+        seen = set()
+        for _, row in df_order.iterrows():
+            if not pd.isna(row.get('ID')):
+                tid = int(row['ID'])
+                if tid not in seen:
+                    main_ids_ordered.append(tid)
+                    seen.add(tid)
 
         stock_data = {}
         for offer_id, data in stock_dict.items():
@@ -654,7 +710,11 @@ async def send_ozon_remains_automatic(context: CallbackContext):
                 "prepare": data['other_stock_count']
             }
 
-        grouped, unmatched = group_ozon_remains_data(stock_data, art_to_id, id_to_name)
+        grouped, unmatched = group_ozon_remains_data(
+            stock_data,
+            template_id_to_cabinet_arts,
+            template_id_to_name
+        )
 
         template_data = []
         for id_val in main_ids_ordered:
@@ -669,7 +729,7 @@ async def send_ozon_remains_automatic(context: CallbackContext):
                     'Итого на МП': total
                 })
             else:
-                name = id_to_name.get(id_val, f"ID {id_val}")
+                name = template_id_to_name.get(id_val, f"ID {id_val}")
                 template_data.append({
                     'Артикул': name,
                     'Доступно на складах': 0,
@@ -689,7 +749,8 @@ async def send_ozon_remains_automatic(context: CallbackContext):
             })
 
         df_template = pd.DataFrame(template_data)
-        headers_template = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже", "Итого на МП"]
+        headers_template = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже",
+                            "Итого на МП"]
 
         # === Сводка ===
         total_available = sum(data['available_stock_count'] for data in stock_dict.values())

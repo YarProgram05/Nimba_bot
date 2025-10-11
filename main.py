@@ -28,19 +28,23 @@ from states import (
     SELECTING_ACTION,
     WB_REPORT_FILES,
     WB_REMAINS_FILES,
+    WB_REPORT_CABINET_CHOICE,
+    WB_REMAINS_CABINET_CHOICE,
     OZON_REMAINS_CABINET_CHOICE,
     BARCODE_FILES,
     CSV_FILES,
     OZON_SALES_CABINET_CHOICE,
     OZON_SALES_DATE_START,
-    OZON_SALES_DATE_END
+    OZON_SALES_DATE_END,
+    ALL_MP_REMAINS
 )
 
 # Импортируем обработчики
 from handlers.wb_handler import (
     start_wb_report,
     handle_wb_files,
-    generate_wb_report
+    generate_wb_report,
+    handle_wb_sales_cabinet_choice
 )
 from handlers.ozon_remains_handler import (
     start_ozon_remains,
@@ -49,8 +53,7 @@ from handlers.ozon_remains_handler import (
 )
 from handlers.wb_remains_handler import (
     start_wb_remains,
-    handle_wb_remains_files,
-    generate_wb_remains_report
+    handle_wb_cabinet_choice
 )
 from handlers.barcode_handler import (
     start_barcode_generation,
@@ -68,6 +71,7 @@ from handlers.ozon_sales_handler import (
     handle_sales_date_start,
     handle_sales_date_end
 )
+from handlers.all_mp_remains_handler import start_all_mp_remains
 
 # Настройка логгирования
 logging.basicConfig(
@@ -94,6 +98,7 @@ def get_main_menu():
         [
             ["Продажи Ozon", "Продажи WB"],
             ["Остатки товаров Ozon", "Остатки товаров WB"],
+            ["Остатки на всех МП"],
             ["Генерация штрихкодов"],
             ["Конвертация CSV в XLSX"],
             ["Помощь"]
@@ -158,6 +163,8 @@ async def select_action(update: Update, context: CallbackContext) -> int:
         return await start_ozon_remains(update, context)
     elif text == "Остатки товаров WB":
         return await start_wb_remains(update, context)
+    elif text == "Остатки на всех МП":  # ← НОВАЯ СТРОКА
+        return await start_all_mp_remains(update, context)
     elif text == "Генерация штрихкодов":
         return await start_barcode_generation(update, context)
     elif text == "Конвертация CSV в XLSX":
@@ -203,7 +210,7 @@ def main() -> None:
             CommandHandler("help", show_help),
             MessageHandler(
                 filters.Regex(
-                    '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
+                    '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Остатки на всех МП|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
                 ),
                 select_action
             ),
@@ -212,7 +219,7 @@ def main() -> None:
             SELECTING_ACTION: [
                 MessageHandler(
                     filters.Regex(
-                        '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
+                        '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Остатки на всех МП|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
                     ),
                     select_action
                 ),
@@ -221,9 +228,11 @@ def main() -> None:
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_files),
                 MessageHandler(filters.Text("Все файлы отправлены"), generate_wb_report),
             ],
-            WB_REMAINS_FILES: [
-                MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_remains_files),
-                MessageHandler(filters.Text("Все файлы отправлены"), generate_wb_remains_report),
+            WB_REMAINS_CABINET_CHOICE: [
+                CallbackQueryHandler(handle_wb_cabinet_choice),
+            ],
+            WB_REPORT_CABINET_CHOICE: [
+                CallbackQueryHandler(handle_wb_sales_cabinet_choice),
             ],
             OZON_REMAINS_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_cabinet_choice),
@@ -245,6 +254,7 @@ def main() -> None:
             OZON_SALES_DATE_END: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sales_date_end),
             ],
+            ALL_MP_REMAINS: []
         },
         fallbacks=[CommandHandler('start', start)],
         per_message=False,
