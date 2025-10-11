@@ -225,7 +225,8 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
     cabinet_id = 1 if cabinet_data == 'cabinet_1' else 2
     context.user_data['ozon_cabinet_id'] = cabinet_id
 
-    await query.message.edit_text(f"⏳ Получаю остатки с Ozon API (Озон {cabinet_id})...")
+    loading_message = await query.message.edit_text(f"⏳ Получаю остатки с Ozon API (Озон {cabinet_id})...")
+    context.user_data['ozon_remains_loading_message_id'] = loading_message.message_id
 
     try:
         ozon = OzonAPI(cabinet_id=cabinet_id)
@@ -289,13 +290,13 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                     stock_dict[offer_id]['available_stock_count'] += item.get('available_stock_count', 0)
                     stock_dict[offer_id]['return_from_customer_stock_count'] += item.get(
                         'return_from_customer_stock_count', 0)
-                    stock_dict[offer_id]['other_stock_count'] += item.get('other_stock_count', 0)
+                    stock_dict[offer_id]['valid_stock_count'] += item.get('valid_stock_count', 0)
                 else:
                     stock_dict[offer_id] = {
                         'name': item.get('name', offer_id_to_name.get(offer_id, '—')),
                         'available_stock_count': item.get('available_stock_count', 0),
                         'return_from_customer_stock_count': item.get('return_from_customer_stock_count', 0),
-                        'other_stock_count': item.get('other_stock_count', 0)
+                        'valid_stock_count': item.get('valid_stock_count', 0)
                     }
             time.sleep(0.5)
 
@@ -327,7 +328,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                         'name': name,
                         'available_stock_count': stocks.get('present', 0),
                         'return_from_customer_stock_count': 0,
-                        'other_stock_count': stocks.get('reserved', 0)
+                        'valid_stock_count': stocks.get('reserved', 0)
                     }
 
                 time.sleep(0.5)
@@ -338,7 +339,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
             name = data['name']
             available = data['available_stock_count']
             returning = data['return_from_customer_stock_count']
-            prepare = data['other_stock_count']
+            prepare = data['valid_stock_count']
             total = available + returning + prepare
             raw_data.append({
                 'Наименование': name,
@@ -379,7 +380,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
             stock_data[offer_id] = {
                 "available": data['available_stock_count'],
                 "returning": data['return_from_customer_stock_count'],
-                "prepare": data['other_stock_count']
+                "prepare": data['valid_stock_count']
             }
 
         # Группировка по шаблонам
@@ -428,7 +429,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
         # === Сводка по всем остаткам ===
         total_available = sum(data['available_stock_count'] for data in stock_dict.values())
         total_returning = sum(data['return_from_customer_stock_count'] for data in stock_dict.values())
-        total_prepare = sum(data['other_stock_count'] for data in stock_dict.values())
+        total_prepare = sum(data['valid_stock_count'] for data in stock_dict.values())
         total_mp = total_available + total_returning + total_prepare
 
         def fmt_num(x):
@@ -461,12 +462,29 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
         if os.path.exists(report_path):
             os.remove(report_path)
 
+        # Удаляем сообщение о загрузке
+        chat_id = query.message.chat_id
+        try:
+            loading_msg_id = context.user_data.get('ozon_remains_loading_message_id')
+            if loading_msg_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=loading_msg_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение о загрузке остатков: {e}")
+
     except Exception as e:
         logger.error(f"Ошибка при получении данных: {str(e)}", exc_info=True)
         await query.message.reply_text(
             f"❌ Ошибка: {str(e)}",
             reply_markup=ReplyKeyboardRemove()
         )
+        # Удаляем сообщение о загрузке даже при ошибке
+        chat_id = query.message.chat_id
+        try:
+            loading_msg_id = context.user_data.get('ozon_remains_loading_message_id')
+            if loading_msg_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=loading_msg_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение о загрузке остатков при ошибке: {e}")
 
     return ConversationHandler.END
 
@@ -618,13 +636,13 @@ async def send_ozon_remains_automatic(context: CallbackContext):
                     stock_dict[offer_id]['available_stock_count'] += item.get('available_stock_count', 0)
                     stock_dict[offer_id]['return_from_customer_stock_count'] += item.get(
                         'return_from_customer_stock_count', 0)
-                    stock_dict[offer_id]['other_stock_count'] += item.get('other_stock_count', 0)
+                    stock_dict[offer_id]['valid_stock_count'] += item.get('valid_stock_count', 0)
                 else:
                     stock_dict[offer_id] = {
                         'name': item.get('name', offer_id_to_name.get(offer_id, '—')),
                         'available_stock_count': item.get('available_stock_count', 0),
                         'return_from_customer_stock_count': item.get('return_from_customer_stock_count', 0),
-                        'other_stock_count': item.get('other_stock_count', 0)
+                        'valid_stock_count': item.get('valid_stock_count', 0)
                     }
             time.sleep(0.5)
 
@@ -656,7 +674,7 @@ async def send_ozon_remains_automatic(context: CallbackContext):
                         'name': name,
                         'available_stock_count': stocks.get('present', 0),
                         'return_from_customer_stock_count': 0,
-                        'other_stock_count': stocks.get('reserved', 0)
+                        'valid_stock_count': stocks.get('reserved', 0)
                     }
 
                 time.sleep(0.5)
@@ -667,7 +685,7 @@ async def send_ozon_remains_automatic(context: CallbackContext):
             name = data['name']
             available = data['available_stock_count']
             returning = data['return_from_customer_stock_count']
-            prepare = data['other_stock_count']
+            prepare = data['valid_stock_count']
             total = available + returning + prepare
             raw_data.append({
                 'Наименование': name,
@@ -707,7 +725,7 @@ async def send_ozon_remains_automatic(context: CallbackContext):
             stock_data[offer_id] = {
                 "available": data['available_stock_count'],
                 "returning": data['return_from_customer_stock_count'],
-                "prepare": data['other_stock_count']
+                "prepare": data['valid_stock_count']
             }
 
         grouped, unmatched = group_ozon_remains_data(
@@ -755,7 +773,7 @@ async def send_ozon_remains_automatic(context: CallbackContext):
         # === Сводка ===
         total_available = sum(data['available_stock_count'] for data in stock_dict.values())
         total_returning = sum(data['return_from_customer_stock_count'] for data in stock_dict.values())
-        total_prepare = sum(data['other_stock_count'] for data in stock_dict.values())
+        total_prepare = sum(data['valid_stock_count'] for data in stock_dict.values())
         total_mp = total_available + total_returning + total_prepare
 
         def fmt_num(x):

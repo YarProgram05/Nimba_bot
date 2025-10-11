@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 from states import WB_REMAINS_CABINET_CHOICE  # ← ДОЛЖЕН БЫТЬ В states.py
 
+# Импорт новой функции из template_loader
+from utils.template_loader import get_cabinet_articles_by_template_id
+
 
 def clean_article(article):
     """Очистка артикула от лишних символов"""
@@ -103,6 +106,70 @@ class WildberriesAPI:
 
 
 # ======================
+# Нормализация и группировка
+# ======================
+
+def normalize_art(art_str):
+    """Нормализует строку: приводит к нижнему регистру, удаляет лишние пробелы, очищает от невидимых символов"""
+    if not art_str:
+        return ""
+    s = str(art_str)
+    s = ''.join(c for c in s if c.isprintable())
+    s = s.strip().lower()
+    return s
+
+
+def group_wb_remains_data(stock_data, template_id_to_cabinet_arts, template_id_to_name):
+    """
+    Группирует данные остатков WB по шаблонным артикулам.
+
+    :param stock_data: dict {article: {"in_stock": ..., "in_way_from_client": ..., "in_way_to_client": ...}}
+    :param template_id_to_cabinet_arts: dict {template_id: [cabinet_art1, cabinet_art2, ...]}
+    :param template_id_to_name: dict {template_id: "Шаблонное название"}
+    :return: grouped (по template_id), unmatched (артикулы без привязки)
+    """
+    stock_data_clean = {}
+    for art, data in stock_data.items():
+        clean_art = normalize_art(art)
+        if clean_art:
+            stock_data_clean[clean_art] = data
+
+    cabinet_art_to_template_id = {}
+    for template_id, arts in template_id_to_cabinet_arts.items():
+        for art in arts:
+            clean_art = normalize_art(art)
+            if clean_art:
+                cabinet_art_to_template_id[clean_art] = template_id
+
+    grouped = {}
+    unmatched = {}
+
+    for clean_art, data in stock_data_clean.items():
+        template_id = cabinet_art_to_template_id.get(clean_art)
+
+        if template_id is not None:
+            if template_id not in grouped:
+                grouped[template_id] = {
+                    'name': template_id_to_name.get(template_id, f"ID {template_id}"),
+                    'in_stock': 0,
+                    'in_way_from_client': 0,
+                    'in_way_to_client': 0
+                }
+            grouped[template_id]['in_stock'] += data['in_stock']
+            grouped[template_id]['in_way_from_client'] += data['in_way_from_client']
+            grouped[template_id]['in_way_to_client'] += data['in_way_to_client']
+        else:
+            unmatched[clean_art] = {
+                'name': f"НЕОПОЗНАННЫЙ: {clean_art}",
+                'in_stock': data['in_stock'],
+                'in_way_from_client': data['in_way_from_client'],
+                'in_way_to_client': data['in_way_to_client']
+            }
+
+    return grouped, unmatched
+
+
+# ======================
 # Обработчики
 # ======================
 
@@ -133,21 +200,25 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
     if cabinet_data == 'wb_cabinet_1':
         cabinet_id = 1
         cabinet_name = "WB_1 Nimba"
+        sheet_name = "Отдельно ВБ Nimba"
     elif cabinet_data == 'wb_cabinet_2':
         cabinet_id = 2
         cabinet_name = "WB_2 Galioni"
+        sheet_name = "Отдельно ВБ Galioni"
     else:
         await query.message.reply_text("❌ Неизвестный кабинет.")
         return ConversationHandler.END
 
     context.user_data['wb_cabinet_id'] = cabinet_id
 
-    await query.message.edit_text(f"⏳ Получаю остатки с Wildberries API ({cabinet_name})...")
+    loading_msg1 = await query.message.edit_text(f"⏳ Получаю остатки с Wildberries API ({cabinet_name})...")
+    context.user_data['wb_remains_loading_msg1_id'] = loading_msg1.message_id
 
     try:
         wb_api = WildberriesAPI(cabinet_id=cabinet_id)
 
-        await query.message.reply_text("📊 Запрашиваю остатки по товарам...")
+        loading_msg2 = await query.message.reply_text("📊 Запрашиваю остатки по товарам...")
+        context.user_data['wb_remains_loading_msg2_id'] = loading_msg2.message_id
         stocks = wb_api.get_fbo_stocks_v1()
 
         if not stocks:
@@ -185,9 +256,9 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
 
         for article, counts in stock_dict.items():
             total = (
-                counts['in_stock'] +
-                counts['in_way_to_client'] +
-                counts['in_way_from_client']
+                    counts['in_stock'] +
+                    counts['in_way_to_client'] +
+                    counts['in_way_from_client']
             )
             raw_data.append({
                 'Артикул': article,
@@ -200,19 +271,22 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         df_raw = pd.DataFrame(raw_data).sort_values(by='Артикул').reset_index(drop=True)
         headers_raw = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей", "Итого на МП"]
 
-        # === 2. Группировка по шаблону Nimba ===
+        # === 2. Группировка по шаблону Nimba/Galioni ===
+        template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id(sheet_name)
+
+        # Получаем main_ids_ordered — ID в порядке появления в Excel (без дубликатов)
         template_path = os.path.join(root_dir, "База данных артикулов для выкупов и начислений.xlsx")
         if not os.path.exists(template_path):
             template_path = "База данных артикулов для выкупов и начислений.xlsx"
-        if not os.path.exists(template_path):
-            raise Exception("Файл шаблона не найден!")
-
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("template_loader", os.path.join(utils_dir, "template_loader.py"))
-        template_loader = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(template_loader)
-
-        art_to_id, id_to_name, main_ids_ordered = template_loader.load_template("Шаблон_WB")
+        df_order = pd.read_excel(template_path, sheet_name=sheet_name)
+        main_ids_ordered = []
+        seen = set()
+        for _, row in df_order.iterrows():
+            if not pd.isna(row.get('ID')):
+                tid = int(row['ID'])
+                if tid not in seen:
+                    main_ids_ordered.append(tid)
+                    seen.add(tid)
 
         wb_stock_data = {}
         for art, counts in stock_dict.items():
@@ -222,7 +296,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                 "in_way_to_client": counts['in_way_to_client']
             }
 
-        grouped, unmatched = group_wb_remains_data(wb_stock_data, art_to_id, id_to_name)
+        grouped, unmatched = group_wb_remains_data(wb_stock_data, template_id_to_cabinet_arts, template_id_to_name)
 
         template_data = []
         for id_val in main_ids_ordered:
@@ -237,7 +311,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                     'Итого на МП': total
                 })
             else:
-                name = id_to_name.get(id_val, f"ID {id_val}")
+                name = template_id_to_name.get(id_val, f"ID {id_val}")
                 template_data.append({
                     'Артикул': name,
                     'Доступно на складах': 0,
@@ -293,46 +367,42 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         if os.path.exists(report_path):
             os.remove(report_path)
 
+        # Удаляем служебные сообщения
+        chat_id = query.message.chat_id
+        try:
+            msg1_id = context.user_data.get('wb_remains_loading_msg1_id')
+            if msg1_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg1_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить первое сообщение о загрузке WB: {e}")
+
+        try:
+            msg2_id = context.user_data.get('wb_remains_loading_msg2_id')
+            if msg2_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg2_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить второе сообщение о загрузке WB: {e}")
+
     except Exception as e:
         logger.error(f"Ошибка при получении остатков WB (кабинет {cabinet_id}): {str(e)}", exc_info=True)
         await query.message.reply_text(f"❌ Ошибка: {str(e)}", reply_markup=ReplyKeyboardRemove())
+        # Удаляем служебные сообщения даже при ошибке
+        chat_id = query.message.chat_id
+        try:
+            msg1_id = context.user_data.get('wb_remains_loading_msg1_id')
+            if msg1_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg1_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить первое сообщение о загрузке WB при ошибке: {e}")
+
+        try:
+            msg2_id = context.user_data.get('wb_remains_loading_msg2_id')
+            if msg2_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg2_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить второе сообщение о загрузке WB при ошибке: {e}")
 
     return ConversationHandler.END
-
-
-def group_wb_remains_data(stock_data, art_to_id, id_to_name):
-    """Группировка данных остатков WB по шаблону"""
-    all_arts = set(stock_data.keys())
-    grouped = {}
-    unmatched = {}
-
-    for art in all_arts:
-        art_clean = str(art).strip().lower()
-        group_id = art_to_id.get(art_clean, None)
-
-        if group_id is not None:
-            group_name = id_to_name.get(group_id, art)
-
-            if group_id not in grouped:
-                grouped[group_id] = {
-                    'name': group_name,
-                    'in_stock': 0,
-                    'in_way_from_client': 0,
-                    'in_way_to_client': 0
-                }
-
-            grouped[group_id]['in_stock'] += stock_data[art]["in_stock"]
-            grouped[group_id]['in_way_from_client'] += stock_data[art]["in_way_from_client"]
-            grouped[group_id]['in_way_to_client'] += stock_data[art]["in_way_to_client"]
-        else:
-            unmatched[art] = {
-                'name': f"НЕОПОЗНАННЫЙ: {art}",
-                'in_stock': stock_data[art]["in_stock"],
-                'in_way_from_client': stock_data[art]["in_way_from_client"],
-                'in_way_to_client': stock_data[art]["in_way_to_client"]
-            }
-
-    return grouped, unmatched
 
 
 def create_excel_with_two_sheets(df_raw, headers_raw, df_template, headers_template, filename):
@@ -408,9 +478,4 @@ def _write_sheet(ws, df, headers, has_name):
 
 async def handle_wb_remains_files(update: Update, context: CallbackContext):
     await update.message.reply_text("Файлы не требуются.")
-    return ConversationHandler.END
-
-async def generate_wb_remains_report(update: Update, context: CallbackContext):
-    # Этот обработчик больше не используется — выбор кабинета через кнопки
-    await update.message.reply_text("Пожалуйста, используйте команду /wb_remains для выбора кабинета.")
     return ConversationHandler.END

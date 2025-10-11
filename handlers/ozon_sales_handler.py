@@ -176,10 +176,13 @@ async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    sent_message = await update.message.reply_text(
         "🏢 Выберите кабинет Ozon для выгрузки продаж:",
         reply_markup=reply_markup
     )
+    # Сохраняем ID сообщения для последующего удаления
+    context.user_data['ozon_sales_initial_message_id'] = sent_message.message_id
+
     return OZON_SALES_CABINET_CHOICE
 
 
@@ -255,7 +258,9 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         return OZON_SALES_DATE_END
 
     context.user_data['ozon_sales_end_date'] = text
-    await update.message.reply_text("⏳ Загружаю данные с Ozon API... Это может занять несколько минут.")
+    loading_message = await update.message.reply_text(
+        "⏳ Загружаю данные с Ozon API... Это может занять несколько минут.")
+    context.user_data['ozon_sales_loading_message_id'] = loading_message.message_id
 
     start_time = time.time()
     try:
@@ -557,15 +562,45 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         if os.path.exists(report_path):
             os.remove(report_path)
 
+            # Удаляем служебные сообщения
+        chat_id = update.effective_chat.id
+        try:
+            initial_msg_id = context.user_data.get('ozon_sales_initial_message_id')
+            if initial_msg_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=initial_msg_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить начальное сообщение: {e}")
+
+        try:
+            loading_msg_id = context.user_data.get('ozon_sales_loading_message_id')
+            if loading_msg_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=loading_msg_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение о загрузке: {e}")
+
     except Exception as e:
         logger.error(f"Ошибка при генерации отчёта продаж: {e}", exc_info=True)
         await update.message.reply_text(
             f"❌ Ошибка: {str(e)}",
             reply_markup=ReplyKeyboardRemove()
         )
+        # Удаляем служебные сообщения и при ошибке
+        chat_id = update.effective_chat.id
+        try:
+            initial_msg_id = context.user_data.get('ozon_sales_initial_message_id')
+            if initial_msg_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=initial_msg_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить начальное сообщение при ошибке: {e}")
+
+        try:
+            loading_msg_id = context.user_data.get('ozon_sales_loading_message_id')
+            if loading_msg_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=loading_msg_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение о загрузке при ошибке: {e}")
 
     return ConversationHandler.END
-
 
 def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path,
                         total_orders, total_purchases, total_cancels, total_income,
