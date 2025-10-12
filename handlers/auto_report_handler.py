@@ -69,7 +69,7 @@ async def handle_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     logger.info(f"🔍 handle_toggle: получено (repr): {repr(text)} от chat_id={chat_id}")
 
-    text_clean = text.strip()
+    text_clean = text.strip() if text else ""
     if text_clean == "❌ Выключить":
         reports = load_auto_reports()
         chat_id_str = str(chat_id)
@@ -116,8 +116,13 @@ async def handle_interval_type(update: Update, context: ContextTypes.DEFAULT_TYP
     text = update.message.text
     logger.info(f"🔍 handle_interval_type: {repr(text)}")
 
+    if not text:
+        await update.message.reply_text("Не удалось прочитать ваш выбор. Попробуйте снова.")
+        return AUTO_REPORT_FREQUENCY
+
     if text == INTERVAL_TYPE_OPTIONS["hours"]:
         context.user_data['auto_report_config'] = {'schedule': {'type': 'interval_hours'}}
+        logger.info("💾 Сохранено: interval_hours в user_data")
         buttons = [HOUR_OPTIONS[i:i + 4] for i in range(0, len(HOUR_OPTIONS), 4)]
         reply_markup = ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
         await update.message.reply_text("Выберите интервал в часах:", reply_markup=reply_markup)
@@ -125,6 +130,7 @@ async def handle_interval_type(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif text == INTERVAL_TYPE_OPTIONS["days"]:
         context.user_data['auto_report_config'] = {'schedule': {'type': 'interval_days'}}
+        logger.info("💾 Сохранено: interval_days в user_data")
         buttons = [DAY_OPTIONS[i:i + 4] for i in range(0, len(DAY_OPTIONS), 4)]
         reply_markup = ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
         await update.message.reply_text("Выберите интервал в днях:", reply_markup=reply_markup)
@@ -143,10 +149,21 @@ async def handle_interval_type(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка выбора числа (часов или дней)"""
     text = update.message.text
-    text_clean = text.strip()
-    logger.info(f"🔢 Введено число: original={repr(text)}, cleaned={repr(text_clean)}")
+    logger.info(f"🔢 RAW TEXT: {repr(text)} | user_data: {dict(context.user_data)}")
 
+    if not text:
+        await update.message.reply_text("Пожалуйста, введите число.")
+        return AUTO_REPORT_TIME
+
+    text_clean = str(text).strip()
     config = context.user_data.get('auto_report_config', {})
+    logger.info(f"📂 Текущая конфигурация: {config}")
+
+    if not config or 'schedule' not in config:
+        logger.error("❌ Конфигурация отсутствует в user_data! Сброс.")
+        await update.message.reply_text("Произошла ошибка. Начните настройку заново с /start.")
+        return ConversationHandler.END
+
     sched_type = config['schedule']['type']
 
     if sched_type == 'interval_hours':
@@ -200,12 +217,15 @@ async def handle_weekly_day_choice(update: Update, context: ContextTypes.DEFAULT
     day_of_week = int(query.data.split("_")[-1])
     logger.info(f"📅 Выбран день недели: {DAYS_OF_WEEK[day_of_week]} ({day_of_week})")
 
-    # Удаляем inline-клавиатуру из сообщения
+    # Удаляем inline-клавиатуру
     await query.edit_message_reply_markup(reply_markup=None)
 
-    # Отправляем новое сообщение с запросом времени
-    await query.message.reply_text("Введите время отправки в формате ЧЧ:ММ (например, 10:00):")
+    # Сохраняем выбор
+    if 'auto_report_config' not in context.user_data:
+        context.user_data['auto_report_config'] = {'schedule': {}}
     context.user_data['auto_report_config']['schedule']['day_of_week'] = day_of_week
+
+    await query.message.reply_text("Введите время отправки в формате ЧЧ:ММ (например, 10:00):")
     return AUTO_REPORT_DAILY_TIME
 
 
@@ -227,6 +247,10 @@ async def handle_daily_time_input(update: Update, context: ContextTypes.DEFAULT_
             "Неверный формат времени. Введите ЧЧ:ММ (например, 10:00):"
         )
         return AUTO_REPORT_DAILY_TIME
+
+    if 'auto_report_config' not in context.user_data:
+        await update.message.reply_text("Ошибка конфигурации. Начните заново.")
+        return ConversationHandler.END
 
     context.user_data['auto_report_config']['schedule']['time'] = f"{hour:02d}:{minute:02d}"
     await finalize_auto_report(update, context)

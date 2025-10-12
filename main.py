@@ -1,3 +1,5 @@
+# main.py
+
 import os
 import logging
 import warnings
@@ -92,7 +94,8 @@ from utils.auto_report_manager import schedule_all_jobs
 # Настройка логгирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    force=True  # Перезаписывает настройки, если уже были
 )
 logger = logging.getLogger(__name__)
 
@@ -123,8 +126,8 @@ def cleanup_user_data(context: CallbackContext):
                     try:
                         if os.path.exists(file_path):
                             os.remove(file_path)
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Не удалось удалить файл {file_path}: {e}")
         context.user_data.clear()
         return True
     except Exception as e:
@@ -182,17 +185,30 @@ async def select_action(update: Update, context: CallbackContext) -> int:
     return SELECTING_ACTION
 
 
+# === ДЕБАГ: ЛОГИРОВАНИЕ ВСЕХ ОБНОВЛЕНИЙ ===
+async def debug_all_updates(update: Update, context: CallbackContext):
+    logger.info(f"📥 ПОЛНЫЙ UPDATE: {update}")
+    if update.message:
+        logger.info(f"   Текст сообщения: {repr(update.message.text)}")
+        logger.info(f"   Chat ID: {update.effective_chat.id}")
+    if update.callback_query:
+        logger.info(f"   Callback data: {update.callback_query.data}")
+
+
 def main() -> None:
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
         raise ValueError("❌ BOT_TOKEN не задан в .env")
 
-    # Включаем персистентность
-    persistence = PicklePersistence(filepath="bot_conversation_data")
+    # Включаем персистентность с явным указанием имени файла
+    persistence = PicklePersistence(filepath="bot_conversation_data.pkl", update_interval=1)
     application = Application.builder().token(bot_token).persistence(persistence).build()
 
     # Загружаем сохранённые автоотчёты
     schedule_all_jobs(application)
+
+    # === ДОБАВЛЯЕМ ДЕБАГ-ЛОГГЕР (МОЖНО УДАЛИТЬ ПОТОМ) ===
+    application.add_handler(MessageHandler(filters.ALL, debug_all_updates), group=-1)
 
     # Основной диалог
     conv_handler = ConversationHandler(
@@ -245,7 +261,8 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_type)
             ],
             AUTO_REPORT_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time_input)
+                # Используем более надёжный фильтр
+                MessageHandler(filters.UpdateType.MESSAGE & (~filters.COMMAND), handle_time_input)
             ],
             AUTO_REPORT_WEEKLY_DAY: [
                 CallbackQueryHandler(handle_weekly_day_choice)
@@ -270,18 +287,18 @@ def main() -> None:
     # Автоматическое определение режима: webhook или polling
     webhook_url = os.getenv("WEBHOOK_URL")
     if webhook_url:
-        # Режим сервера (Timeweb)
         port = int(os.getenv("PORT", "8443"))
         logger.info(f"📡 Запуск в режиме webhook на порту {port}")
+        # Убедимся, что Telegram отправляет callback_query
+        allowed_updates = ["message", "callback_query", "chat_member"]
         application.run_webhook(
             listen="0.0.0.0",
             port=port,
             url_path=bot_token,
-            webhook_url=f"{webhook_url}/{bot_token}",
-            allowed_updates=Update.ALL_TYPES  # ← КЛЮЧЕВОЙ ПАРАМЕТР
+            webhook_url=f"{webhook_url.rstrip('/')}/{bot_token}",
+            allowed_updates=allowed_updates  # ← Явно разрешаем callback_query
         )
     else:
-        # Режим разработки (локально)
         logger.info("📡 Запуск в режиме polling")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
