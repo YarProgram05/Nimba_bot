@@ -194,7 +194,6 @@ async def debug_all_updates(update: Update, context: CallbackContext):
     if update.callback_query:
         logger.info(f"   Callback data: {update.callback_query.data}")
 
-
 def main() -> None:
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
