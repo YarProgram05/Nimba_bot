@@ -1,11 +1,1 @@
-{
-  "726413418": {
-    "enabled": true,
-    "report_type": "all_mp",
-    "schedule": {
-      "type": "interval_hours",
-      "hours": 3
-    },
-    "chat_id": 726413418
-  }
-}
+{}
