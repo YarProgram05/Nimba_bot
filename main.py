@@ -37,8 +37,9 @@ from states import (
     ALL_MP_REMAINS,
     AUTO_REPORT_TOGGLE,
     AUTO_REPORT_FREQUENCY,
-    AUTO_REPORT_DAY,
-    AUTO_REPORT_TIME
+    AUTO_REPORT_WEEKLY_DAY,
+    AUTO_REPORT_TIME,
+    AUTO_REPORT_DAILY_TIME
 )
 
 # Импортируем обработчики
@@ -76,12 +77,14 @@ from handlers.all_mp_remains_handler import (
     start_all_mp_remains,
     send_all_mp_remains_automatic
 )
+# Импортируем обработчики автоотчётов
 from handlers.auto_report_handler import (
     start_auto_report,
     handle_toggle,
-    handle_interval_type,   # ← новое
+    handle_interval_type,
     handle_time_input,
-    handle_daily_time       # ← новое
+    handle_weekly_day_choice,
+    handle_daily_time_input
 )
 
 # Менеджер автоотчётов
@@ -246,8 +249,11 @@ def main() -> None:
             AUTO_REPORT_TIME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time_input)
             ],
-            AUTO_REPORT_DAY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_time)
+            AUTO_REPORT_WEEKLY_DAY: [
+                CallbackQueryHandler(handle_weekly_day_choice)
+            ],
+            AUTO_REPORT_DAILY_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_time_input)
             ],
         },
         fallbacks=[CommandHandler('start', start)],

@@ -23,6 +23,7 @@ ALL_MP_REMAINS = 10
 
 # Для автоотчётов
 AUTO_REPORT_TOGGLE = 12
-AUTO_REPORT_FREQUENCY = 13      # выбор "По часам / По дням"
-AUTO_REPORT_TIME = 14           # выбор числа (часов или дней)
-AUTO_REPORT_DAY = 15            # ввод времени для интервала в днях
+AUTO_REPORT_FREQUENCY = 13
+AUTO_REPORT_TIME = 14           # выбор числа (часов/дней)
+AUTO_REPORT_WEEKLY_DAY = 15     # выбор дня недели (ТОЛЬКО callback)
+AUTO_REPORT_DAILY_TIME = 16     # ввод времени (для 1-6 дней и после выбора дня)

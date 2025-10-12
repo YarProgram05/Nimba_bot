@@ -107,20 +107,28 @@ def schedule_job(application, callback, config, job_data, chat_id):
         time_str = schedule['time']
         target_time = dtime.fromisoformat(time_str)
 
-        # Найдём ближайшую дату
-        next_run = now.replace(
-            hour=target_time.hour,
-            minute=target_time.minute,
-            second=0,
-            microsecond=0
-        )
-        if now > next_run:
-            next_run += timedelta(days=days)
-        first_run = (next_run - now).total_seconds()
+        if days == 7 and 'day_of_week' in schedule:
+            # Еженедельно в конкретный день
+            target_weekday = schedule['day_of_week']
+            next_run = get_next_weekday_at_time(target_weekday, target_time, moscow_tz)
+            first_run = (next_run - now).total_seconds()
+            interval_sec = 7 * 24 * 3600
+        else:
+            # Каждые N дней (1-6)
+            next_run = now.replace(
+                hour=target_time.hour,
+                minute=target_time.minute,
+                second=0,
+                microsecond=0
+            )
+            if now > next_run:
+                next_run += timedelta(days=days)
+            first_run = (next_run - now).total_seconds()
+            interval_sec = days * 24 * 3600
 
         application.job_queue.run_repeating(
             callback=callback,
-            interval=days * 24 * 3600,
+            interval=interval_sec,
             first=first_run,
             data=job_data,
             name=f"auto_report_{chat_id}"

@@ -1,7 +1,7 @@
 # handlers/auto_report_handler.py
 
 import logging
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 from zoneinfo import ZoneInfo
 
@@ -10,7 +10,13 @@ from utils.auto_report_manager import load_auto_reports, save_auto_reports, sche
 logger = logging.getLogger(__name__)
 
 # Состояния
-from states import AUTO_REPORT_TOGGLE, AUTO_REPORT_FREQUENCY, AUTO_REPORT_TIME, AUTO_REPORT_DAY
+from states import (
+    AUTO_REPORT_TOGGLE,
+    AUTO_REPORT_FREQUENCY,
+    AUTO_REPORT_TIME,
+    AUTO_REPORT_WEEKLY_DAY,
+    AUTO_REPORT_DAILY_TIME
+)
 
 # Единственная callback-функция
 from handlers.all_mp_remains_handler import send_all_mp_remains_automatic
@@ -23,6 +29,16 @@ INTERVAL_TYPE_OPTIONS = {
 
 HOUR_OPTIONS = ["1", "2", "3", "4", "5", "6", "12", "24"]
 DAY_OPTIONS = ["1", "2", "3", "4", "5", "6", "7"]
+
+DAYS_OF_WEEK = {
+    0: "Понедельник",
+    1: "Вторник",
+    2: "Среда",
+    3: "Четверг",
+    4: "Пятница",
+    5: "Суббота",
+    6: "Воскресенье"
+}
 
 
 async def start_auto_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,15 +142,16 @@ async def handle_interval_type(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка выбора числа (часов или дней)"""
-    text = update.message.text.strip()
-    logger.info(f"🔢 Введено число: {repr(text)}")
+    text = update.message.text
+    text_clean = text.strip()
+    logger.info(f"🔢 Введено число: original={repr(text)}, cleaned={repr(text_clean)}")
 
     config = context.user_data.get('auto_report_config', {})
     sched_type = config['schedule']['type']
 
     if sched_type == 'interval_hours':
-        if text in HOUR_OPTIONS:
-            config['schedule']['hours'] = int(text)
+        if text_clean in HOUR_OPTIONS:
+            config['schedule']['hours'] = int(text_clean)
             await finalize_auto_report(update, context)
             return ConversationHandler.END
         else:
@@ -144,13 +161,29 @@ async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return AUTO_REPORT_TIME
 
     elif sched_type == 'interval_days':
-        if text in DAY_OPTIONS:
-            config['schedule']['days'] = int(text)
-            await update.message.reply_text(
-                "Введите время отправки в формате ЧЧ:ММ (например, 10:00):",
-                reply_markup=ReplyKeyboardRemove()
-            )
-            return AUTO_REPORT_DAY
+        if text_clean in DAY_OPTIONS:
+            days = int(text_clean)
+            config['schedule']['days'] = days
+            if days == 7:
+                logger.info("🗓️ Режим 7 дней — показываем inline-кнопки")
+                keyboard = []
+                for i in range(0, 7, 2):
+                    row = []
+                    for j in range(2):
+                        if i + j < 7:
+                            row.append(InlineKeyboardButton(DAYS_OF_WEEK[i + j], callback_data=f"weekly_day_{i + j}"))
+                    keyboard.append(row)
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text("Выберите день недели для еженедельного отчёта:",
+                                                reply_markup=reply_markup)
+                return AUTO_REPORT_WEEKLY_DAY
+            else:
+                logger.info(f"📆 Режим {days} дней — запрашиваем время")
+                await update.message.reply_text(
+                    "Введите время отправки в формате ЧЧ:ММ (например, 10:00):",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+                return AUTO_REPORT_DAILY_TIME
         else:
             buttons = [DAY_OPTIONS[i:i + 4] for i in range(0, len(DAY_OPTIONS), 4)]
             reply_markup = ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
@@ -160,8 +193,24 @@ async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def handle_daily_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ввод времени для интервала в днях"""
+async def handle_weekly_day_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора дня недели для 7 дней"""
+    query = update.callback_query
+    await query.answer()
+    day_of_week = int(query.data.split("_")[-1])
+    logger.info(f"📅 Выбран день недели: {DAYS_OF_WEEK[day_of_week]} ({day_of_week})")
+
+    # Удаляем inline-клавиатуру из сообщения
+    await query.edit_message_reply_markup(reply_markup=None)
+
+    # Отправляем новое сообщение с запросом времени
+    await query.message.reply_text("Введите время отправки в формате ЧЧ:ММ (например, 10:00):")
+    context.user_data['auto_report_config']['schedule']['day_of_week'] = day_of_week
+    return AUTO_REPORT_DAILY_TIME
+
+
+async def handle_daily_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ввод времени для 1-6 дней или после выбора дня недели"""
     time_str = update.message.text.strip()
     logger.info(f"🕒 Введено время: {repr(time_str)}")
 
@@ -177,7 +226,7 @@ async def handle_daily_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Неверный формат времени. Введите ЧЧ:ММ (например, 10:00):"
         )
-        return AUTO_REPORT_DAY
+        return AUTO_REPORT_DAILY_TIME
 
     context.user_data['auto_report_config']['schedule']['time'] = f"{hour:02d}:{minute:02d}"
     await finalize_auto_report(update, context)
@@ -213,8 +262,12 @@ async def finalize_auto_report(update: Update, context: ContextTypes.DEFAULT_TYP
     sched = config['schedule']
     if sched['type'] == 'interval_hours':
         details = f"Каждые {sched['hours']} ч"
-    else:  # interval_days
-        details = f"Каждые {sched['days']} дн в {sched['time']}"
+    elif sched['type'] == 'interval_days':
+        if sched.get('day_of_week') is not None:
+            day_name = DAYS_OF_WEEK[sched['day_of_week']]
+            details = f"Каждый {day_name} в {sched['time']}"
+        else:
+            details = f"Каждые {sched['days']} дн в {sched['time']}"
 
     await update.message.reply_text(
         f"✅ Автоотчёт по всем маркетплейсам настроен!\n\n"
