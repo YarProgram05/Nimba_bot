@@ -280,7 +280,7 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
-
+    logger.info("hello world!")
     logger.info("📡 Запуск в режиме polling")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
