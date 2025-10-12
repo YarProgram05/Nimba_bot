@@ -11,7 +11,7 @@ from telegram.ext import (
     CallbackContext,
     ConversationHandler,
     filters,
-    PicklePersistence  # ← ДОБАВЛЕНО
+    PicklePersistence
 )
 from dotenv import load_dotenv
 
@@ -37,8 +37,8 @@ from states import (
     ALL_MP_REMAINS,
     AUTO_REPORT_TOGGLE,
     AUTO_REPORT_FREQUENCY,
-    AUTO_REPORT_WEEKLY_DAY,
     AUTO_REPORT_TIME,
+    AUTO_REPORT_WEEKLY_DAY,
     AUTO_REPORT_DAILY_TIME
 )
 
@@ -77,7 +77,6 @@ from handlers.all_mp_remains_handler import (
     start_all_mp_remains,
     send_all_mp_remains_automatic
 )
-# Импортируем обработчики автоотчётов
 from handlers.auto_report_handler import (
     start_auto_report,
     handle_toggle,
@@ -188,15 +187,14 @@ def main() -> None:
     if not bot_token:
         raise ValueError("❌ BOT_TOKEN не задан в .env")
 
-    # 🔑 ВКЛЮЧАЕМ ПЕРСИСТЕНТНОСТЬ
-    persistence = PicklePersistence(filepath="bot_conversation_data.pickle")
-
+    # Включаем персистентность
+    persistence = PicklePersistence(filepath="bot_conversation_data")
     application = Application.builder().token(bot_token).persistence(persistence).build()
 
-    # Загружаем сохранённые автоматические отчёты
+    # Загружаем сохранённые автоотчёты
     schedule_all_jobs(application)
 
-    # === ОСНОВНОЙ ДИАЛОГ ===
+    # Основной диалог
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
@@ -260,7 +258,6 @@ def main() -> None:
         per_message=False,
         per_chat=True,
         per_user=True,
-        # 🔑 КЛЮЧЕВЫЕ ПАРАМЕТРЫ ДЛЯ РАБОТЫ СОСТОЯНИЙ:
         name="main_conversation",
         persistent=True,
         allow_reentry=True
@@ -269,7 +266,24 @@ def main() -> None:
     application.add_handler(conv_handler)
 
     logger.info("🚀 Бот запущен!")
-    application.run_polling()
+
+    # Автоматическое определение режима: webhook или polling
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if webhook_url:
+        # Режим сервера (Timeweb)
+        port = int(os.getenv("PORT", "8443"))
+        logger.info(f"📡 Запуск в режиме webhook на порту {port}")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=bot_token,
+            webhook_url=f"{webhook_url}/{bot_token}",
+            allowed_updates=Update.ALL_TYPES  # ← КЛЮЧЕВОЙ ПАРАМЕТР
+        )
+    else:
+        # Режим разработки (локально)
+        logger.info("📡 Запуск в режиме polling")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == '__main__':
