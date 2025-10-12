@@ -282,26 +282,8 @@ def main() -> None:
 
     application.add_handler(conv_handler)
 
-    logger.info("🚀 Бот запущен!")
-
-    # Автоматическое определение режима: webhook или polling
-    webhook_url = os.getenv("WEBHOOK_URL")
-    if webhook_url:
-        port = int(os.getenv("PORT", "8443"))
-        logger.info(f"📡 Запуск в режиме webhook на порту {port}")
-        # Убедимся, что Telegram отправляет callback_query
-        allowed_updates = ["message", "callback_query", "chat_member"]
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=bot_token,
-            webhook_url=f"{webhook_url.rstrip('/')}/{bot_token}",
-            allowed_updates=allowed_updates  # ← Явно разрешаем callback_query
-        )
-    else:
-        logger.info("📡 Запуск в режиме polling")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    logger.info("📡 Запуск в режиме polling")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
