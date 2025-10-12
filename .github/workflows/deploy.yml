@@ -16,6 +16,7 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
             cd /root/Nimba_bot
-            git pull origin master
+            git fetch origin master
+            git reset --hard origin/master  # ← СБРАСЫВАЕТ ВСЁ НА АКТУАЛЬНУЮ ВЕРСИЮ
             pip3 install -r requirements.txt
             systemctl restart nimba-bot
