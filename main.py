@@ -10,12 +10,10 @@ from telegram.ext import (
     CallbackQueryHandler,
     CallbackContext,
     ConversationHandler,
-    filters
+    filters,
+    PicklePersistence  # ← ДОБАВЛЕНО
 )
 from dotenv import load_dotenv
-import datetime
-from datetime import time as tm
-from zoneinfo import ZoneInfo  # Python 3.9+
 
 # Подавляем warning о per_message=False
 warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*per_message=False.*")
@@ -28,15 +26,19 @@ from states import (
     SELECTING_ACTION,
     WB_REPORT_FILES,
     WB_REMAINS_FILES,
-    WB_REPORT_CABINET_CHOICE,
     WB_REMAINS_CABINET_CHOICE,
+    WB_REPORT_CABINET_CHOICE,
     OZON_REMAINS_CABINET_CHOICE,
     BARCODE_FILES,
     CSV_FILES,
     OZON_SALES_CABINET_CHOICE,
     OZON_SALES_DATE_START,
     OZON_SALES_DATE_END,
-    ALL_MP_REMAINS
+    ALL_MP_REMAINS,
+    AUTO_REPORT_TOGGLE,
+    AUTO_REPORT_FREQUENCY,
+    AUTO_REPORT_DAY,
+    AUTO_REPORT_TIME
 )
 
 # Импортируем обработчики
@@ -48,8 +50,7 @@ from handlers.wb_handler import (
 )
 from handlers.ozon_remains_handler import (
     start_ozon_remains,
-    handle_cabinet_choice,
-    send_ozon_remains_automatic
+    handle_cabinet_choice
 )
 from handlers.wb_remains_handler import (
     start_wb_remains,
@@ -71,7 +72,20 @@ from handlers.ozon_sales_handler import (
     handle_sales_date_start,
     handle_sales_date_end
 )
-from handlers.all_mp_remains_handler import start_all_mp_remains
+from handlers.all_mp_remains_handler import (
+    start_all_mp_remains,
+    send_all_mp_remains_automatic
+)
+from handlers.auto_report_handler import (
+    start_auto_report,
+    handle_toggle,
+    handle_interval_type,   # ← новое
+    handle_time_input,
+    handle_daily_time       # ← новое
+)
+
+# Менеджер автоотчётов
+from utils.auto_report_manager import schedule_all_jobs
 
 # Настройка логгирования
 logging.basicConfig(
@@ -80,17 +94,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def get_next_monday_10am(tz):
-    """Возвращает datetime ближайшего понедельника в 10:00 по указанному часовому поясу"""
-    now = datetime.datetime.now(tz)
-    days_ahead = (0 - now.weekday()) % 7  # 0 = понедельник
-    next_monday = now.replace(hour=10, minute=0, second=0, microsecond=0) + datetime.timedelta(days=days_ahead)
-
-    # Если сегодня понедельник, но уже после 10:00 — берём следующий понедельник
-    if days_ahead == 0 and now.time() > datetime.time(10, 0):
-        next_monday += datetime.timedelta(weeks=1)
-
-    return next_monday
 
 def get_main_menu():
     """Возвращает главное меню с кнопками"""
@@ -99,6 +102,7 @@ def get_main_menu():
             ["Продажи Ozon", "Продажи WB"],
             ["Остатки товаров Ozon", "Остатки товаров WB"],
             ["Остатки на всех МП"],
+            ["Автоотчёты"],
             ["Генерация штрихкодов"],
             ["Конвертация CSV в XLSX"],
             ["Помощь"]
@@ -128,13 +132,13 @@ def cleanup_user_data(context: CallbackContext):
 
 async def start(update: Update, context: CallbackContext) -> int:
     cleanup_user_data(context)
-    # print("Ваш chat_id:", update.effective_chat.id)
     welcome_text = (
         "🔄 Бот сброшен. Добро пожаловать!\n\n"
         "Я помогу вам:\n"
         "📊 Анализировать продажи и остатки на Ozon и Wildberries\n"
         "🏷️ Генерировать штрихкоды\n"
-        "🔄 Конвертировать CSV файлы в XLSX\n\n"
+        "🔄 Конвертировать CSV файлы в XLSX\n"
+        "🤖 Настраивать автоматические отчёты\n\n"
         "Выберите действие из меню ниже:"
     )
     await update.message.reply_text(welcome_text, reply_markup=get_main_menu())
@@ -163,8 +167,10 @@ async def select_action(update: Update, context: CallbackContext) -> int:
         return await start_ozon_remains(update, context)
     elif text == "Остатки товаров WB":
         return await start_wb_remains(update, context)
-    elif text == "Остатки на всех МП":  # ← НОВАЯ СТРОКА
+    elif text == "Остатки на всех МП":
         return await start_all_mp_remains(update, context)
+    elif text == "Автоотчёты":
+        return await start_auto_report(update, context)
     elif text == "Генерация штрихкодов":
         return await start_barcode_generation(update, context)
     elif text == "Конвертация CSV в XLSX":
@@ -179,50 +185,25 @@ def main() -> None:
     if not bot_token:
         raise ValueError("❌ BOT_TOKEN не задан в .env")
 
-    application = Application.builder().token(bot_token).build()
+    # 🔑 ВКЛЮЧАЕМ ПЕРСИСТЕНТНОСТЬ
+    persistence = PicklePersistence(filepath="bot_conversation_data.pickle")
 
-    # === 🗓️ ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ: КАЖДЫЙ ПОНЕДЕЛЬНИК В 10:00 ПО МОСКВЕ ===
-    YOUR_CHAT_ID = 726413418  # ← ваш ID
-    moscow_tz = ZoneInfo("Europe/Moscow")
+    application = Application.builder().token(bot_token).persistence(persistence).build()
 
-    next_run = get_next_monday_10am(moscow_tz)
-    first_run_seconds = (next_run - datetime.datetime.now(moscow_tz)).total_seconds()
+    # Загружаем сохранённые автоматические отчёты
+    schedule_all_jobs(application)
 
-    # Кабинет 1
-    application.job_queue.run_repeating(
-        callback=send_ozon_remains_automatic,
-        interval=7 * 24 * 60 * 60,  # 7 дней в секундах
-        first=first_run_seconds,
-        data={'chat_id': YOUR_CHAT_ID, 'cabinet_id': 1}
-    )
-
-    # Кабинет 2 (на 1 минуту позже)
-    application.job_queue.run_repeating(
-        callback=send_ozon_remains_automatic,
-        interval=7 * 24 * 60 * 60,
-        first=first_run_seconds + 60,
-        data={'chat_id': YOUR_CHAT_ID, 'cabinet_id': 2}
-    )
-
+    # === ОСНОВНОЙ ДИАЛОГ ===
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("help", show_help),
-            MessageHandler(
-                filters.Regex(
-                    '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Остатки на всех МП|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
-                ),
-                select_action
-            ),
         ],
         states={
             SELECTING_ACTION: [
-                MessageHandler(
-                    filters.Regex(
-                        '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Остатки на всех МП|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
-                    ),
-                    select_action
-                ),
+                MessageHandler(filters.Regex(
+                    '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Остатки на всех МП|Автоотчёты|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
+                ), select_action),
             ],
             WB_REPORT_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_files),
@@ -254,12 +235,29 @@ def main() -> None:
             OZON_SALES_DATE_END: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sales_date_end),
             ],
-            ALL_MP_REMAINS: []
+            ALL_MP_REMAINS: [],
+            # Состояния автоотчётов
+            AUTO_REPORT_TOGGLE: [
+                MessageHandler(filters.Text(["✅ Включить", "❌ Выключить"]), handle_toggle)
+            ],
+            AUTO_REPORT_FREQUENCY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_type)
+            ],
+            AUTO_REPORT_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time_input)
+            ],
+            AUTO_REPORT_DAY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_time)
+            ],
         },
         fallbacks=[CommandHandler('start', start)],
         per_message=False,
         per_chat=True,
-        per_user=True
+        per_user=True,
+        # 🔑 КЛЮЧЕВЫЕ ПАРАМЕТРЫ ДЛЯ РАБОТЫ СОСТОЯНИЙ:
+        name="main_conversation",
+        persistent=True,
+        allow_reentry=True
     )
 
     application.add_handler(conv_handler)
