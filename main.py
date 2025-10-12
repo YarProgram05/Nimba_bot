@@ -184,7 +184,6 @@ async def select_action(update: Update, context: CallbackContext) -> int:
         return await show_help(update, context)
     return SELECTING_ACTION
 
-
 # === ДЕБАГ: ЛОГИРОВАНИЕ ВСЕХ ОБНОВЛЕНИЙ ===
 async def debug_all_updates(update: Update, context: CallbackContext):
     logger.info(f"📥 ПОЛНЫЙ UPDATE: {update}")
