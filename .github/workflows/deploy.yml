@@ -16,7 +16,10 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
             cd /root/Nimba_bot
-            git fetch origin master
-            git reset --hard origin/master  # ← СБРАСЫВАЕТ ВСЁ НА АКТУАЛЬНУЮ ВЕРСИЮ
+            # Сохраняем текущие настройки автоотчётов
+            cp auto_reports.json /tmp/auto_reports_backup.json || true
+            git reset --hard origin/master
+            # Восстанавливаем настройки
+            cp /tmp/auto_reports_backup.json auto_reports.json || true
             pip3 install -r requirements.txt
             systemctl restart nimba-bot
