@@ -3,9 +3,8 @@
     "enabled": false,
     "report_type": "all_mp",
     "schedule": {
-      "type": "interval_days",
-      "days": 2,
-      "time": "11:23"
+      "type": "interval_hours",
+      "hours": 2
     },
     "chat_id": 726413418
   }

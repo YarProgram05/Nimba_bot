@@ -85,7 +85,8 @@ from handlers.auto_report_handler import (
     handle_interval_type_inline,
     handle_time_inline,
     handle_weekly_day_choice,
-    handle_daily_time_input
+    handle_daily_time_input,
+    handle_back_from_time_input
 )
 
 # Менеджер автоотчётов
@@ -265,7 +266,8 @@ def main() -> None:
                 CallbackQueryHandler(handle_weekly_day_choice)
             ],
             AUTO_REPORT_DAILY_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_time_input)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_time_input),
+                CallbackQueryHandler(handle_back_from_time_input)
             ],
         },
         fallbacks=[CommandHandler('start', start)],
