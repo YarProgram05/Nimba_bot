@@ -81,9 +81,9 @@ from handlers.all_mp_remains_handler import (
 )
 from handlers.auto_report_handler import (
     start_auto_report,
-    handle_toggle,
-    handle_interval_type,
-    handle_time_input,
+    handle_toggle_inline,
+    handle_interval_type_inline,
+    handle_time_inline,
     handle_weekly_day_choice,
     handle_daily_time_input
 )
@@ -138,7 +138,7 @@ def cleanup_user_data(context: CallbackContext):
 async def start(update: Update, context: CallbackContext) -> int:
     cleanup_user_data(context)
     welcome_text = (
-        "🔄 Бот сброшен. Добро пожаловать!\n\n"
+        "Добро пожаловать!\n\n"
         "Я помогу вам:\n"
         "📊 Анализировать продажи и остатки на Ozon и Wildberries\n"
         "🏷️ Генерировать штрихкоды\n"
@@ -253,14 +253,13 @@ def main() -> None:
             ALL_MP_REMAINS: [],
             # Состояния автоотчётов
             AUTO_REPORT_TOGGLE: [
-                MessageHandler(filters.Text(["✅ Включить", "❌ Выключить"]), handle_toggle)
+                CallbackQueryHandler(handle_toggle_inline)
             ],
             AUTO_REPORT_FREQUENCY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_type)
+                CallbackQueryHandler(handle_interval_type_inline)
             ],
             AUTO_REPORT_TIME: [
-                # Используем более надёжный фильтр
-                MessageHandler(filters.UpdateType.MESSAGE & (~filters.COMMAND), handle_time_input)
+                CallbackQueryHandler(handle_time_inline)
             ],
             AUTO_REPORT_WEEKLY_DAY: [
                 CallbackQueryHandler(handle_weekly_day_choice)
