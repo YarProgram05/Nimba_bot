@@ -27,3 +27,5 @@ AUTO_REPORT_FREQUENCY = 13
 AUTO_REPORT_TIME = 14           # выбор числа (часов/дней)
 AUTO_REPORT_WEEKLY_DAY = 15     # выбор дня недели (ТОЛЬКО callback)
 AUTO_REPORT_DAILY_TIME = 16     # ввод времени (для 1-6 дней и после выбора дня)
+AUTO_REPORT_START_TIME = 17
+AUTO_REPORT_START_DAY = 18

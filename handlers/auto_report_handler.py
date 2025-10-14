@@ -14,7 +14,9 @@ from states import (
     AUTO_REPORT_FREQUENCY,
     AUTO_REPORT_TIME,
     AUTO_REPORT_WEEKLY_DAY,
-    AUTO_REPORT_DAILY_TIME
+    AUTO_REPORT_DAILY_TIME,
+    AUTO_REPORT_START_TIME,
+    AUTO_REPORT_START_DAY
 )
 
 from handlers.all_mp_remains_handler import send_all_mp_remains_automatic
@@ -34,7 +36,6 @@ DAYS_OF_WEEK = {
 
 
 async def _delete_message_if_exists(context, chat, message_id):
-    """Безопасное удаление сообщения"""
     if message_id:
         try:
             await context.bot.delete_message(chat_id=chat.id, message_id=message_id)
@@ -51,19 +52,18 @@ def get_current_schedule_description(reports, chat_id_str):
     sched_type = sched.get('type')
 
     if sched_type == 'interval_hours':
-        return f"Каждые {sched['hours']} ч"
+        return f"Каждые {sched['hours']} ч, начиная с {sched['start_time']}"
     elif sched_type == 'interval_days':
         if 'day_of_week' in sched:
             day_name = DAYS_OF_WEEK.get(sched['day_of_week'], "Неизвестный день")
             return f"Каждый {day_name} в {sched['time']}"
         else:
-            return f"Каждые {sched['days']} дн в {sched['time']}"
+            return f"Каждые {sched['days']} дн, начиная с {DAYS_OF_WEEK.get(sched['start_day'], '??')} в {sched['time']}"
     return ""
 
 
-async def _send_message_and_save_id(context, chat, text, reply_markup=None):
-    """Отправка сообщения с сохранением ID"""
-    sent = await chat.send_message(text, reply_markup=reply_markup)
+async def _send_message_and_save_id(context, chat, text, reply_markup=None, parse_mode=None):
+    sent = await chat.send_message(text, reply_markup=reply_markup, parse_mode=parse_mode)
     context.user_data['current_message_id'] = sent.message_id
     return sent.message_id
 
@@ -72,7 +72,6 @@ async def _send_message_and_save_id(context, chat, text, reply_markup=None):
 async def start_auto_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("✅ start_auto_report вызван!")
 
-    # Очищаем конфигурацию при новом запуске
     context.user_data.pop('auto_report_config', None)
     context.user_data.pop('current_message_id', None)
 
@@ -113,7 +112,6 @@ async def handle_toggle_inline(update: Update, context: ContextTypes.DEFAULT_TYP
     data = query.data
     logger.info(f"🔍 handle_toggle_inline: {data}")
 
-    # Удаляем стартовое сообщение
     current_msg_id = context.user_data.get('current_message_id')
     await _delete_message_if_exists(context, chat, current_msg_id)
 
@@ -130,7 +128,6 @@ async def handle_toggle_inline(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
     elif data == "auto_toggle_on":
-        # Единое сообщение: выбор + меню
         keyboard = [
             [
                 InlineKeyboardButton("🕗 По часам", callback_data="interval_hours"),
@@ -159,7 +156,6 @@ async def handle_interval_type_inline(update: Update, context: ContextTypes.DEFA
     data = query.data
     logger.info(f"🔍 handle_interval_type_inline: {data}")
 
-    # Удаляем сообщение выбора интервала
     current_msg_id = context.user_data.get('current_message_id')
     await _delete_message_if_exists(context, chat, current_msg_id)
 
@@ -167,7 +163,6 @@ async def handle_interval_type_inline(update: Update, context: ContextTypes.DEFA
         return await start_auto_report(update, context)
 
     if data == "interval_hours":
-        # Сохраняем конфигурацию
         context.user_data['auto_report_config'] = {'schedule': {'type': 'interval_hours'}}
         keyboard = []
         for i in range(0, len(HOUR_OPTIONS), 4):
@@ -182,7 +177,6 @@ async def handle_interval_type_inline(update: Update, context: ContextTypes.DEFA
         return AUTO_REPORT_TIME
 
     elif data == "interval_days":
-        # Сохраняем конфигурацию
         context.user_data['auto_report_config'] = {'schedule': {'type': 'interval_days'}}
         keyboard = []
         for i in range(0, len(DAY_OPTIONS), 4):
@@ -210,12 +204,10 @@ async def handle_time_inline(update: Update, context: ContextTypes.DEFAULT_TYPE)
     data = query.data
     logger.info(f"🔢 handle_time_inline: {data}")
 
-    # Удаляем сообщение выбора часов/дней
     current_msg_id = context.user_data.get('current_message_id')
     await _delete_message_if_exists(context, chat, current_msg_id)
 
     if data == "back_to_frequency":
-        # Возвращаемся к выбору интервала
         keyboard = [
             [
                 InlineKeyboardButton("🕗 По часам", callback_data="interval_hours"),
@@ -240,10 +232,14 @@ async def handle_time_inline(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data.startswith("hour_"):
         hours = data.split("_")[1]
         if hours in HOUR_OPTIONS:
-            await chat.send_message(f"✅ Автоотчёт настроен: каждые {hours} ч")
             config['schedule']['hours'] = int(hours)
-            await _finalize_auto_report_common(chat.id, context, chat)
-            return ConversationHandler.END
+            keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_from_start_time")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await _send_message_and_save_id(context, chat,
+                "Введите время начала отсчёта в формате ЧЧ:ММ (например, 10:00):",
+                reply_markup
+            )
+            return AUTO_REPORT_START_TIME
 
     elif data.startswith("day_"):
         days_str = data.split("_")[1]
@@ -267,19 +263,32 @@ async def handle_time_inline(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
                 return AUTO_REPORT_WEEKLY_DAY
             else:
-                keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_from_time_input")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await _send_message_and_save_id(context, chat,
-                    "Введите время отправки в формате ЧЧ:ММ (например, 10:00):",
-                    reply_markup
+                # Отправляем объяснение с жирным шрифтом через HTML
+                explanation = (
+                    "ℹ️ Важно! Чтобы настроить автоотчёт правильно:\n\n"
+                    "Укажите день отсчёта <b>из текущей недели</b> (Пн–Вс).\n\n"
+                    "Бот рассчитает ближайшую дату отправки, начиная с этого дня.\n\n"
+                    "Выберите день начала отсчёта:"
                 )
-                return AUTO_REPORT_DAILY_TIME
+                keyboard = []
+                for i in range(0, 7, 2):
+                    row = []
+                    for j in range(2):
+                        if i + j < 7:
+                            row.append(InlineKeyboardButton(DAYS_OF_WEEK[i + j], callback_data=f"start_day_{i + j}"))
+                    keyboard.append(row)
+                keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_time")])
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await _send_message_and_save_id(
+                    context, chat, explanation, reply_markup, parse_mode="HTML"
+                )
+                return AUTO_REPORT_START_DAY
 
     await chat.send_message("Неверный выбор. Попробуйте снова.")
     return ConversationHandler.END
 
 
-# === ШАГ 5: Выбор дня недели ===
+# === ШАГ 5: Выбор дня недели (только для 7 дней) ===
 async def handle_weekly_day_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -287,7 +296,6 @@ async def handle_weekly_day_choice(update: Update, context: ContextTypes.DEFAULT
     chat = query.message.chat
     data = query.data
 
-    # Удаляем сообщение выбора дня недели
     current_msg_id = context.user_data.get('current_message_id')
     await _delete_message_if_exists(context, chat, current_msg_id)
 
@@ -324,7 +332,7 @@ async def handle_weekly_day_choice(update: Update, context: ContextTypes.DEFAULT
     return AUTO_REPORT_DAILY_TIME
 
 
-# === ШАГ 6: Ввод времени ===
+# === ШАГ 6: Ввод времени (для дней и недель) ===
 async def handle_daily_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_str = update.message.text.strip()
     logger.info(f"🕒 Введено время: {repr(time_str)}")
@@ -357,14 +365,90 @@ async def handle_daily_time_input(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
-# === Обработка "Назад" из ввода времени ===
+# === ШАГ 7: Ввод времени начала (для часов) ===
+async def handle_start_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    time_str = update.message.text.strip()
+    logger.info(f"🕒 Введено время начала: {repr(time_str)}")
+
+    chat = update.effective_chat
+
+    try:
+        parts = time_str.split(':')
+        if len(parts) != 2:
+            raise ValueError("Неверный формат")
+        hour, minute = int(parts[0]), int(parts[1])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("Неверное время")
+    except Exception as e:
+        logger.warning(f"⚠️ Неверное время начала: {e}")
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_from_start_time")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await chat.send_message(
+            "Неверный формат времени. Введите ЧЧ:ММ (например, 10:00):",
+            reply_markup=reply_markup
+        )
+        return AUTO_REPORT_START_TIME
+
+    if 'auto_report_config' not in context.user_data:
+        await chat.send_message("Ошибка конфигурации. Начните заново.")
+        return ConversationHandler.END
+
+    context.user_data['auto_report_config']['schedule']['start_time'] = f"{hour:02d}:{minute:02d}"
+    await _finalize_auto_report_common(chat.id, context, chat)
+    return ConversationHandler.END
+
+
+# === ШАГ 8: Выбор дня начала (для дней, кроме 7) ===
+async def handle_start_day_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat = query.message.chat
+    data = query.data
+
+    current_msg_id = context.user_data.get('current_message_id')
+    await _delete_message_if_exists(context, chat, current_msg_id)
+
+    if data == "back_to_time":
+        # Возвращаемся к выбору интервала в днях
+        config = context.user_data.get('auto_report_config', {})
+        if config.get('schedule', {}).get('type') == 'interval_days':
+            days = config['schedule'].get('days', 1)
+            keyboard = []
+            for i in range(0, len(DAY_OPTIONS), 4):
+                row = [InlineKeyboardButton(d, callback_data=f"day_{d}") for d in DAY_OPTIONS[i:i + 4]]
+                keyboard.append(row)
+            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_frequency")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await _send_message_and_save_id(context, chat,
+                f"Выбрано: {days} дн\n\nВыберите интервал в днях:",
+                reply_markup
+            )
+            return AUTO_REPORT_TIME
+
+    start_day = int(data.split("_")[-1])
+    day_name = DAYS_OF_WEEK[start_day]
+    logger.info(f"📅 Выбран день начала: {day_name} ({start_day})")
+
+    if 'auto_report_config' not in context.user_data:
+        context.user_data['auto_report_config'] = {'schedule': {}}
+    context.user_data['auto_report_config']['schedule']['start_day'] = start_day
+
+    keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_from_time_input")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await _send_message_and_save_id(context, chat,
+        f"Выбрано: {day_name}\n\nВведите время отправки в формате ЧЧ:ММ (например, 10:00):",
+        reply_markup
+    )
+    return AUTO_REPORT_DAILY_TIME
+
+
+# === Обработка "Назад" из ввода времени (для дней и недель) ===
 async def handle_back_from_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     chat = query.message.chat
-
-    # Удаляем сообщение ввода времени
     current_msg_id = context.user_data.get('current_message_id')
     await _delete_message_if_exists(context, chat, current_msg_id)
 
@@ -389,13 +473,41 @@ async def handle_back_from_time_input(update: Update, context: ContextTypes.DEFA
         return AUTO_REPORT_WEEKLY_DAY
     else:
         keyboard = []
-        for i in range(0, len(DAY_OPTIONS), 4):
-            row = [InlineKeyboardButton(d, callback_data=f"day_{d}") for d in DAY_OPTIONS[i:i + 4]]
+        for i in range(0, 7, 2):
+            row = []
+            for j in range(2):
+                if i + j < 7:
+                    row.append(InlineKeyboardButton(DAYS_OF_WEEK[i + j], callback_data=f"start_day_{i + j}"))
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_time")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await _send_message_and_save_id(context, chat,
+            "Выберите день начала отсчёта:",
+            reply_markup
+        )
+        return AUTO_REPORT_START_DAY
+
+
+# === Обработка "Назад" из ввода времени начала (для часов) ===
+async def handle_back_from_start_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat = query.message.chat
+    current_msg_id = context.user_data.get('current_message_id')
+    await _delete_message_if_exists(context, chat, current_msg_id)
+
+    config = context.user_data.get('auto_report_config', {})
+    if config.get('schedule', {}).get('type') == 'interval_hours':
+        hours = config['schedule'].get('hours', 1)
+        keyboard = []
+        for i in range(0, len(HOUR_OPTIONS), 4):
+            row = [InlineKeyboardButton(h, callback_data=f"hour_{h}") for h in HOUR_OPTIONS[i:i + 4]]
             keyboard.append(row)
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_frequency")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         await _send_message_and_save_id(context, chat,
-            f"Выбрано: {days} дн\n\nВыберите интервал в днях:",
+            f"Выбрано: {hours} ч\n\nВыберите интервал в часах:",
             reply_markup
         )
         return AUTO_REPORT_TIME
@@ -424,13 +536,14 @@ async def _finalize_auto_report_common(chat_id, context, chat):
 
     sched = config['schedule']
     if sched['type'] == 'interval_hours':
-        details = f"Каждые {sched['hours']} ч"
+        details = f"Каждые {sched['hours']} ч, начиная с {sched['start_time']}"
     elif sched['type'] == 'interval_days':
-        if sched.get('day_of_week') is not None:
+        if 'day_of_week' in sched:
             day_name = DAYS_OF_WEEK[sched['day_of_week']]
             details = f"Каждый {day_name} в {sched['time']}"
         else:
-            details = f"Каждые {sched['days']} дн в {sched['time']}"
+            start_day_name = DAYS_OF_WEEK.get(sched['start_day'], "Неизвестный день")
+            details = f"Каждые {sched['days']} дн, начиная с {start_day_name} в {sched['time']}"
 
     await chat.send_message(
         f"✅ Автоотчёт по всем маркетплейсам настроен!\n\n"

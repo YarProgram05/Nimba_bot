@@ -41,7 +41,9 @@ from states import (
     AUTO_REPORT_FREQUENCY,
     AUTO_REPORT_TIME,
     AUTO_REPORT_WEEKLY_DAY,
-    AUTO_REPORT_DAILY_TIME
+    AUTO_REPORT_DAILY_TIME,
+    AUTO_REPORT_START_TIME,
+    AUTO_REPORT_START_DAY
 )
 
 # Импортируем обработчики
@@ -86,7 +88,10 @@ from handlers.auto_report_handler import (
     handle_time_inline,
     handle_weekly_day_choice,
     handle_daily_time_input,
-    handle_back_from_time_input
+    handle_start_time_input,
+    handle_start_day_choice,
+    handle_back_from_time_input,
+    handle_back_from_start_time
 )
 
 # Менеджер автоотчётов
@@ -265,9 +270,17 @@ def main() -> None:
             AUTO_REPORT_WEEKLY_DAY: [
                 CallbackQueryHandler(handle_weekly_day_choice)
             ],
+            AUTO_REPORT_START_DAY: [
+                CallbackQueryHandler(handle_start_day_choice),
+                CallbackQueryHandler(handle_back_from_time_input)  # ← важно!
+            ],
             AUTO_REPORT_DAILY_TIME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_time_input),
                 CallbackQueryHandler(handle_back_from_time_input)
+            ],
+            AUTO_REPORT_START_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_start_time_input),
+                CallbackQueryHandler(handle_back_from_start_time)
             ],
         },
         fallbacks=[CommandHandler('start', start)],

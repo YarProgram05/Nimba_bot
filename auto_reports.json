@@ -4,7 +4,8 @@
     "report_type": "all_mp",
     "schedule": {
       "type": "interval_hours",
-      "hours": 2
+      "hours": 2,
+      "start_time": "17:32"
     },
     "chat_id": 726413418
   }
