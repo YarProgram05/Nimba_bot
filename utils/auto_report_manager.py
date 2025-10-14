@@ -112,17 +112,27 @@ def schedule_job(application, callback, config, job_data, chat_id):
         start_time_str = schedule.get('start_time', "00:00")
         start_time = dtime.fromisoformat(start_time_str)
 
-        first_run_dt = now.replace(
+        # Находим базовую дату: сегодня или вчера в start_time
+        base_dt = now.replace(
             hour=start_time.hour,
             minute=start_time.minute,
             second=0,
             microsecond=0
         )
-        if now > first_run_dt:
-            first_run_dt += timedelta(days=1)
-        first_run = (first_run_dt - now).total_seconds()
 
+        # Если сейчас уже позже start_time сегодня — сдвигаемся на вчера,
+        # чтобы не пропустить возможные точки в сегодняшнем дне
+        if now.time() > start_time:
+            base_dt -= timedelta(days=1)
+
+        # Ищем первую точку в будущем, кратную интервалу от базы
+        next_run = base_dt
+        while next_run <= now:
+            next_run += timedelta(hours=hours)
+
+        first_run = (next_run - now).total_seconds()
         interval_sec = hours * 3600
+
         application.job_queue.run_repeating(
             callback=callback,
             interval=interval_sec,
@@ -130,6 +140,7 @@ def schedule_job(application, callback, config, job_data, chat_id):
             data=job_data,
             name=f"auto_report_{chat_id}"
         )
+        logger.info(f"Запланирован часовой автоотчёт для {chat_id}: первый запуск {next_run}")
 
     elif sched_type == "interval_days":
         days = schedule['days']
@@ -155,3 +166,4 @@ def schedule_job(application, callback, config, job_data, chat_id):
             data=job_data,
             name=f"auto_report_{chat_id}"
         )
+        logger.info(f"Запланирован дневной автоотчёт для {chat_id}: первый запуск {next_run}")
