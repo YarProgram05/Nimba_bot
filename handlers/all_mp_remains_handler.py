@@ -6,12 +6,14 @@ import shutil
 import logging
 import pandas as pd
 import time
+import asyncio
 from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import CallbackContext, ConversationHandler
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.utils import get_column_letter
+from requests.exceptions import Timeout, RequestException
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
@@ -24,12 +26,13 @@ if utils_dir not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-from states import ALL_MP_REMAINS
 from handlers.ozon_remains_handler import OzonAPI
 from handlers.wb_remains_handler import WildberriesAPI
 from handlers.ozon_remains_handler import clean_offer_id
 from handlers.wb_remains_handler import clean_article
 
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # секунды
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ: СЫРЫЕ ДАННЫЕ ===
 
@@ -178,54 +181,69 @@ async def fetch_ozon_remains_raw(cabinet_id):
 
 
 async def fetch_wb_remains_raw(cabinet_id):
-    wb = WildberriesAPI(cabinet_id=cabinet_id)
-    stocks = wb.get_fbo_stocks_v1()
-
-    # === АГРЕГАЦИЯ СЫРЫХ ДАННЫХ ПО АРТИКУЛАМ ===
     raw_stock_dict = {}
-
-    for item in stocks:
-        art = clean_article(item.get("supplierArticle"))
-        if not art:
-            continue
-
-        quantity = item.get('quantity', 0)
-        in_way_to_client = item.get('inWayToClient', 0)
-        in_way_from_client = item.get('inWayFromClient', 0)
-
-        if art not in raw_stock_dict:
-            raw_stock_dict[art] = {
-                'quantity': 0,
-                'in_way_to_client': 0,
-                'in_way_from_client': 0
-            }
-
-        raw_stock_dict[art]['quantity'] += quantity
-        raw_stock_dict[art]['in_way_to_client'] += in_way_to_client
-        raw_stock_dict[art]['in_way_from_client'] += in_way_from_client
-
-    # === СОЗДАНИЕ АГРЕГИРОВАННЫХ СЫРЫХ ДАННЫХ ===
     raw_data = []
     stock_dict = {}
 
-    for art, data in raw_stock_dict.items():
-        total = data['quantity'] + data['in_way_to_client'] + data['in_way_from_client']
-        raw_data.append({
-            'Артикул': art,
-            'Доступно на складах': data['quantity'],
-            'Возвращаются от покупателей': data['in_way_from_client'],
-            'В пути до покупателей': data['in_way_to_client'],
-            'Итого на МП': total
-        })
+    for attempt in range(MAX_RETRIES):
+        try:
+            wb = WildberriesAPI(cabinet_id=cabinet_id)
+            stocks = wb.get_fbo_stocks_v1()  # ← это синхронный вызов
 
-        # Также заполняем stock_dict для сводного отчёта
-        stock_dict[art] = {
-            'avail': data['quantity'],
-            'return': data['in_way_from_client'],
-            'inway': data['in_way_to_client']
-        }
+            # Агрегация данных (как у тебя было)
+            for item in stocks:
+                art = clean_article(item.get("supplierArticle"))
+                if not art:
+                    continue
 
-    return stock_dict, raw_data
+                quantity = item.get('quantity', 0)
+                in_way_to_client = item.get('inWayToClient', 0)
+                in_way_from_client = item.get('inWayFromClient', 0)
+
+                if art not in raw_stock_dict:
+                    raw_stock_dict[art] = {
+                        'quantity': 0,
+                        'in_way_to_client': 0,
+                        'in_way_from_client': 0
+                    }
+
+                raw_stock_dict[art]['quantity'] += quantity
+                raw_stock_dict[art]['in_way_to_client'] += in_way_to_client
+                raw_stock_dict[art]['in_way_from_client'] += in_way_from_client
+
+            # Формируем raw_data и stock_dict
+            for art, data in raw_stock_dict.items():
+                total = data['quantity'] + data['in_way_to_client'] + data['in_way_from_client']
+                raw_data.append({
+                    'Артикул': art,
+                    'Доступно на складах': data['quantity'],
+                    'Возвращаются от покупателей': data['in_way_from_client'],
+                    'В пути до покупателей': data['in_way_to_client'],
+                    'Итого на МП': total
+                })
+                stock_dict[art] = {
+                    'avail': data['quantity'],
+                    'return': data['in_way_from_client'],
+                    'inway': data['in_way_to_client']
+                }
+
+            logger.info(f"✅ Успешно получены остатки WB кабинет {cabinet_id} (попытка {attempt + 1})")
+            return stock_dict, raw_data
+
+        except (Timeout, RequestException) as e:
+            logger.warning(f"⚠️ Попытка {attempt + 1}/{MAX_RETRIES} не удалась для WB кабинет {cabinet_id}: {e}")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                logger.error(f"❌ Все попытки получения остатков WB кабинет {cabinet_id} провалились")
+                # Возвращаем пустые данные, но не падаем
+                return {}, []
+
+        except Exception as e:
+            logger.error(f"❌ Неизвестная ошибка при получении WB остатков кабинет {cabinet_id}: {e}", exc_info=True)
+            return {}, []
+
+    return {}, []
 
 
 # === ФУНКЦИЯ НОРМАЛИЗАЦИИ ===

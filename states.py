@@ -29,3 +29,11 @@ AUTO_REPORT_WEEKLY_DAY = 15     # выбор дня недели (ТОЛЬКО c
 AUTO_REPORT_DAILY_TIME = 16     # ввод времени (для 1-6 дней и после выбора дня)
 AUTO_REPORT_START_TIME = 17
 AUTO_REPORT_START_DAY = 18
+SELECTING_AUTO_REPORT_TYPE = 19
+
+AUTO_REPORT_TYPE_ALL_MP_REMAINS = "all_mp_remains"
+
+# Человекочитаемые названия
+AUTO_REPORT_TYPE_LABELS = {
+    AUTO_REPORT_TYPE_ALL_MP_REMAINS: "Остатки на всех МП"
+}

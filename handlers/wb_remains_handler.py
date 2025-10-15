@@ -70,11 +70,13 @@ class WildberriesAPI:
         last_change_date = "2010-01-01T00:00:00"
 
         while True:
+            # 🔥 ИСПРАВЛЕНО: удалены лишние пробелы в конце URL!
             url = "https://statistics-api.wildberries.ru/api/v1/supplier/stocks"
             params = {"dateFrom": last_change_date}
 
             try:
                 response = requests.get(url, headers=self.headers, params=params, timeout=10)
+                response.raise_for_status()
                 logger.info(f"Запрос FBO остатков v1, статус={response.status_code}, dateFrom={last_change_date}")
 
                 if response.status_code == 200:
@@ -98,8 +100,15 @@ class WildberriesAPI:
                 else:
                     logger.error(f"Ошибка v1 stocks: {response.status_code} - {response.text}")
                     break
+
+            except requests.exceptions.Timeout:
+                logger.error(f"Таймаут при запросе FBO остатков (dateFrom={last_change_date})")
+                break
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Ошибка сети при запросе FBO остатков: {e}")
+                break
             except Exception as e:
-                logger.error(f"Исключение в v1 stocks: {e}", exc_info=True)
+                logger.error(f"Неожиданная ошибка в v1 stocks: {e}", exc_info=True)
                 break
 
         return all_stocks

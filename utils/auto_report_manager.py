@@ -57,6 +57,8 @@ def get_next_interval_day(start_day, interval_days, target_time, tz):
     ) + timedelta(days=interval_days)
 
 
+# utils/auto_report_manager.py
+
 def load_auto_reports():
     if os.path.exists(AUTO_REPORTS_FILE):
         try:
@@ -76,56 +78,72 @@ def save_auto_reports(reports):
         logger.error(f"Ошибка сохранения auto_reports.json: {e}")
 
 
+def get_user_report_config(reports, chat_id_str, report_type):
+    """Возвращает конфиг для конкретного типа отчёта у пользователя."""
+    return reports.get(chat_id_str, {}).get(report_type, {})
+
+
+def set_user_report_config(reports, chat_id_str, report_type, config):
+    """Устанавливает конфиг для конкретного типа отчёта."""
+    if chat_id_str not in reports:
+        reports[chat_id_str] = {}
+    reports[chat_id_str][report_type] = config
+
+
+# Обновлённая schedule_all_jobs
 def schedule_all_jobs(application: Application):
     from handlers.all_mp_remains_handler import send_all_mp_remains_automatic
 
+    REPORT_TYPE_TO_CALLBACK = {
+        'all_mp_remains': send_all_mp_remains_automatic
+    }
+
     reports = load_auto_reports()
-    for chat_id_str, config in reports.items():
-        if not config.get('enabled'):
+    for chat_id_str, user_configs in reports.items():
+        if not isinstance(user_configs, dict):
             continue
 
         chat_id = int(chat_id_str)
-        job_data = {'chat_id': chat_id}
 
-        report_type = config['report_type']
-        if report_type == 'all_mp':
-            callback = send_all_mp_remains_automatic
-        else:
-            continue
+        for report_type, config in user_configs.items():
+            if not config.get('enabled'):
+                continue
 
-        current_jobs = application.job_queue.get_jobs_by_name(f"auto_report_{chat_id}")
-        for job in current_jobs:
-            job.schedule_removal()
+            callback = REPORT_TYPE_TO_CALLBACK.get(report_type)
+            if not callback:
+                continue
 
-        schedule_job(application, callback, config, job_data, chat_id)
+            job_data = {'chat_id': chat_id, 'report_type': report_type}
+            current_jobs = application.job_queue.get_jobs_by_name(f"auto_report_{chat_id}_{report_type}")
+            for job in current_jobs:
+                job.schedule_removal()
+
+            schedule_job(application, callback, config, job_data, chat_id, report_type)
 
 
-def schedule_job(application, callback, config, job_data, chat_id):
+def schedule_job(application, callback, config, job_data, chat_id, report_type):
     moscow_tz = ZoneInfo("Europe/Moscow")
     now = datetime.now(moscow_tz)
 
     schedule = config['schedule']
     sched_type = schedule['type']
 
+    job_name = f"auto_report_{chat_id}_{report_type}"
+
     if sched_type == "interval_hours":
         hours = schedule['hours']
         start_time_str = schedule.get('start_time', "00:00")
         start_time = dtime.fromisoformat(start_time_str)
 
-        # Находим базовую дату: сегодня или вчера в start_time
         base_dt = now.replace(
             hour=start_time.hour,
             minute=start_time.minute,
             second=0,
             microsecond=0
         )
-
-        # Если сейчас уже позже start_time сегодня — сдвигаемся на вчера,
-        # чтобы не пропустить возможные точки в сегодняшнем дне
         if now.time() > start_time:
             base_dt -= timedelta(days=1)
 
-        # Ищем первую точку в будущем, кратную интервалу от базы
         next_run = base_dt
         while next_run <= now:
             next_run += timedelta(hours=hours)
@@ -138,9 +156,9 @@ def schedule_job(application, callback, config, job_data, chat_id):
             interval=interval_sec,
             first=first_run,
             data=job_data,
-            name=f"auto_report_{chat_id}"
+            name=job_name
         )
-        logger.info(f"Запланирован часовой автоотчёт для {chat_id}: первый запуск {next_run}")
+        logger.info(f"Запланирован часовой автоотчёт {report_type} для {chat_id}: {next_run}")
 
     elif sched_type == "interval_days":
         days = schedule['days']
@@ -150,20 +168,18 @@ def schedule_job(application, callback, config, job_data, chat_id):
         if days == 7 and 'day_of_week' in schedule:
             target_weekday = schedule['day_of_week']
             next_run = get_next_weekday_at_time(target_weekday, target_time, moscow_tz)
-            first_run = (next_run - now).total_seconds()
-            interval_sec = 7 * 24 * 3600
-
         else:
             start_day = schedule.get('start_day', 0)
             next_run = get_next_interval_day(start_day, days, target_time, moscow_tz)
-            first_run = (next_run - now).total_seconds()
-            interval_sec = days * 24 * 3600
+
+        first_run = (next_run - now).total_seconds()
+        interval_sec = days * 24 * 3600
 
         application.job_queue.run_repeating(
             callback=callback,
             interval=interval_sec,
             first=first_run,
             data=job_data,
-            name=f"auto_report_{chat_id}"
+            name=job_name
         )
-        logger.info(f"Запланирован дневной автоотчёт для {chat_id}: первый запуск {next_run}")
+        logger.info(f"Запланирован дневной автоотчёт {report_type} для {chat_id}: {next_run}")

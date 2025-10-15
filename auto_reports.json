@@ -1,12 +1,13 @@
 {
   "726413418": {
-    "enabled": false,
-    "report_type": "all_mp",
-    "schedule": {
-      "type": "interval_hours",
-      "hours": 4,
-      "start_time": "12:36"
-    },
-    "chat_id": 726413418
+    "all_mp_remains": {
+      "enabled": false,
+      "schedule": {
+        "type": "interval_days",
+        "days": 4,
+        "start_day": 0,
+        "time": "17:32"
+      }
+    }
   }
 }

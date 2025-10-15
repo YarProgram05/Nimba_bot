@@ -4,7 +4,13 @@ import logging
 from telegram import Update, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 
-from utils.auto_report_manager import load_auto_reports, save_auto_reports, schedule_job
+from utils.auto_report_manager import (
+    load_auto_reports,
+    save_auto_reports,
+    schedule_job,
+    get_user_report_config,
+    set_user_report_config
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +22,13 @@ from states import (
     AUTO_REPORT_WEEKLY_DAY,
     AUTO_REPORT_DAILY_TIME,
     AUTO_REPORT_START_TIME,
-    AUTO_REPORT_START_DAY
+    AUTO_REPORT_START_DAY,
+    SELECTING_AUTO_REPORT_TYPE
 )
+# Типы отчётов
+AUTO_REPORT_TYPES = {
+    "all_mp_remains": "Остатки на всех МП"
+}
 
 from handlers.all_mp_remains_handler import send_all_mp_remains_automatic
 
@@ -42,13 +53,10 @@ async def _delete_message_if_exists(context, chat, message_id):
         except Exception as e:
             logger.debug(f"Не удалось удалить сообщение {message_id}: {e}")
 
-
-def get_current_schedule_description(reports, chat_id_str):
-    user_config = reports.get(chat_id_str, {})
-    if not user_config.get('enabled'):
+def get_current_schedule_description_for_type(config):
+    if not config.get('enabled'):
         return ""
-
-    sched = user_config.get('schedule', {})
+    sched = config.get('schedule', {})
     sched_type = sched.get('type')
 
     if sched_type == 'interval_hours':
@@ -58,7 +66,8 @@ def get_current_schedule_description(reports, chat_id_str):
             day_name = DAYS_OF_WEEK.get(sched['day_of_week'], "Неизвестный день")
             return f"Каждый {day_name} в {sched['time']}"
         else:
-            return f"Каждые {sched['days']} дн, начиная с {DAYS_OF_WEEK.get(sched['start_day'], '??')} в {sched['time']}"
+            start_day_name = DAYS_OF_WEEK.get(sched['start_day'], "??")
+            return f"Каждые {sched['days']} дн, начиная с {start_day_name} в {sched['time']}"
     return ""
 
 
@@ -67,24 +76,71 @@ async def _send_message_and_save_id(context, chat, text, reply_markup=None, pars
     context.user_data['current_message_id'] = sent.message_id
     return sent.message_id
 
+async def _show_report_type_selection(context: ContextTypes.DEFAULT_TYPE, chat):
+    """Показывает меню выбора типа автоотчёта."""
+    keyboard = [
+        [InlineKeyboardButton(name, callback_data=f"select_report_type_{key}")]
+        for key, name in AUTO_REPORT_TYPES.items()
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    sent = await chat.send_message(
+        "Выберите тип автоотчёта:",
+        reply_markup=reply_markup
+    )
+    context.user_data['current_message_id'] = sent.message_id
+
 
 # === ШАГ 1: Старт ===
 async def start_auto_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("✅ start_auto_report вызван!")
 
-    context.user_data.pop('auto_report_config', None)
-    context.user_data.pop('current_message_id', None)
+    # Очищаем старые данные
+    keys_to_clear = [k for k in context.user_data.keys() if k.startswith('auto_report_') or k == 'current_message_id']
+    for k in keys_to_clear:
+        context.user_data.pop(k, None)
 
-    reports = load_auto_reports()
     chat = update.effective_chat
-    chat_id = str(chat.id)
-    user_config = reports.get(chat_id, {})
+    await _show_report_type_selection(context, chat)
+    return SELECTING_AUTO_REPORT_TYPE
+
+async def handle_select_report_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("select_report_type_"):
+        await query.message.reply_text("⚠️ Неизвестный тип отчёта.")
+        return ConversationHandler.END
+
+    report_type = data.split("_", 3)[-1]
+    if report_type not in AUTO_REPORT_TYPES:
+        await query.message.reply_text("⚠️ Неизвестный тип отчёта.")
+        return ConversationHandler.END
+
+    context.user_data['selected_report_type'] = report_type
+    context.user_data['selected_report_label'] = AUTO_REPORT_TYPES[report_type]
+
+    # <<< УДАЛЯЕМ ПРЕДЫДУЩЕЕ СООБЩЕНИЕ (меню выбора типа) >>>
+    current_msg_id = context.user_data.get('current_message_id')
+    chat = query.message.chat
+    if current_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=chat.id, message_id=current_msg_id)
+        except Exception as e:
+            logger.debug(f"Не удалось удалить сообщение {current_msg_id}: {e}")
+
+    # Получаем конфиг
+    chat_id = chat.id
+    chat_id_str = str(chat_id)
+    reports = load_auto_reports()
+    user_config = get_user_report_config(reports, chat_id_str, report_type)
     enabled = user_config.get('enabled', False)
 
     status = "включены" if enabled else "выключены"
     description = ""
     if enabled:
-        description = get_current_schedule_description(reports, chat_id)
+        description = get_current_schedule_description_for_type(user_config)
         if description:
             description = f"\nТекущая настройка: {description}\n"
 
@@ -96,10 +152,13 @@ async def start_auto_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await _send_message_and_save_id(context, chat,
-        f"Автоотчёты по всем маркетплейсам сейчас {status}.{description}\nВыберите действие:",
-        reply_markup
+    # <<< ОТПРАВЛЯЕМ НОВОЕ СООБЩЕНИЕ И СОХРАНЯЕМ ЕГО ID >>>
+    sent = await chat.send_message(
+        f"Автоотчёт «{AUTO_REPORT_TYPES[report_type]}» сейчас {status}.{description}\nВыберите действие:",
+        reply_markup=reply_markup
     )
+    context.user_data['current_message_id'] = sent.message_id
+
     return AUTO_REPORT_TOGGLE
 
 
@@ -116,15 +175,24 @@ async def handle_toggle_inline(update: Update, context: ContextTypes.DEFAULT_TYP
     await _delete_message_if_exists(context, chat, current_msg_id)
 
     if data == "auto_toggle_off":
+        report_type = context.user_data.get('selected_report_type', 'all_mp_remains')
+
+        # <<< ИСПРАВЛЕНИЕ: определяем chat_id_str >>>
+        chat_id = chat.id
+        chat_id_str = str(chat_id)
+
         reports = load_auto_reports()
-        chat_id_str = str(chat.id)
-        if chat_id_str in reports:
-            reports[chat_id_str]['enabled'] = False
+        user_configs = reports.get(chat_id_str, {})
+        if report_type in user_configs:
+            user_configs[report_type]['enabled'] = False
             save_auto_reports(reports)
-            current_jobs = context.job_queue.get_jobs_by_name(f"auto_report_{chat.id}")
-            for job in current_jobs:
-                job.schedule_removal()
-        await chat.send_message("✅ Автоотчёты отключены.")
+
+        # Удаляем задачи для этого типа
+        current_jobs = context.job_queue.get_jobs_by_name(f"auto_report_{chat.id}_{report_type}")
+        for job in current_jobs:
+            job.schedule_removal()
+
+        await chat.send_message(f"✅ Автоотчёт «{AUTO_REPORT_TYPES.get(report_type, 'Неизвестный')}» отключён.")
         return ConversationHandler.END
 
     elif data == "auto_toggle_on":
@@ -160,7 +228,9 @@ async def handle_interval_type_inline(update: Update, context: ContextTypes.DEFA
     await _delete_message_if_exists(context, chat, current_msg_id)
 
     if data == "back_to_toggle":
-        return await start_auto_report(update, context)
+        # <<< ИСПРАВЛЕНИЕ: не вызываем start_auto_report! >>>
+        await _show_report_type_selection(context, chat)
+        return SELECTING_AUTO_REPORT_TYPE
 
     if data == "interval_hours":
         context.user_data['auto_report_config'] = {'schedule': {'type': 'interval_hours'}}
@@ -246,6 +316,8 @@ async def handle_time_inline(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if days_str in DAY_OPTIONS:
             days = int(days_str)
             config['schedule']['days'] = days
+            # <<< СОХРАНЯЕМ В КОНТЕКСТ >>>
+            context.user_data['auto_report_config']['schedule']['days'] = days
             if days == 7:
                 logger.info("🗓️ Режим 7 дней — показываем inline-кнопки выбора дня недели")
                 keyboard = []
@@ -452,11 +524,13 @@ async def handle_back_from_time_input(update: Update, context: ContextTypes.DEFA
     current_msg_id = context.user_data.get('current_message_id')
     await _delete_message_if_exists(context, chat, current_msg_id)
 
+    # <<< ПОЛУЧАЕМ days из контекста >>>
     config = context.user_data.get('auto_report_config', {})
     sched = config.get('schedule', {})
     days = sched.get('days', 1)
 
     if days == 7:
+        # Еженедельный режим
         keyboard = []
         for i in range(0, 7, 2):
             row = []
@@ -472,6 +546,13 @@ async def handle_back_from_time_input(update: Update, context: ContextTypes.DEFA
         )
         return AUTO_REPORT_WEEKLY_DAY
     else:
+        # Циклический режим (<7 дней) — показываем объяснение!
+        explanation = (
+            "ℹ️ Важно! Чтобы настроить автоотчёт правильно:\n\n"
+            "Укажите день отсчёта <b>из текущей недели</b> (Пн–Вс).\n\n"
+            "Бот рассчитает ближайшую дату отправки, начиная с этого дня.\n\n"
+            "Выберите день начала отсчёта:"
+        )
         keyboard = []
         for i in range(0, 7, 2):
             row = []
@@ -481,9 +562,8 @@ async def handle_back_from_time_input(update: Update, context: ContextTypes.DEFA
             keyboard.append(row)
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_time")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await _send_message_and_save_id(context, chat,
-            "Выберите день начала отсчёта:",
-            reply_markup
+        await _send_message_and_save_id(
+            context, chat, explanation, reply_markup, parse_mode="HTML"
         )
         return AUTO_REPORT_START_DAY
 
@@ -515,25 +595,30 @@ async def handle_back_from_start_time(update: Update, context: ContextTypes.DEFA
 
 # === Финализация ===
 async def _finalize_auto_report_common(chat_id, context, chat):
+    report_type = context.user_data['selected_report_type']
     config = context.user_data.get('auto_report_config', {})
 
     full_config = {
         'enabled': True,
-        'report_type': 'all_mp',
-        'schedule': config['schedule'],
-        'chat_id': chat_id
+        'schedule': config['schedule']
     }
 
     reports = load_auto_reports()
-    reports[str(chat_id)] = full_config
+    set_user_report_config(reports, str(chat_id), report_type, full_config)
     save_auto_reports(reports)
 
-    current_jobs = context.job_queue.get_jobs_by_name(f"auto_report_{chat_id}")
+    # Удаляем старые задачи для этого типа
+    current_jobs = context.job_queue.get_jobs_by_name(f"auto_report_{chat_id}_{report_type}")
     for job in current_jobs:
         job.schedule_removal()
 
-    schedule_job(context.application, send_all_mp_remains_automatic, full_config, {'chat_id': chat_id}, chat_id)
+    # Запускаем новую
+    from handlers.all_mp_remains_handler import send_all_mp_remains_automatic
+    callback = send_all_mp_remains_automatic  # пока только один тип
 
+    schedule_job(context.application, callback, full_config, {'chat_id': chat_id, 'report_type': report_type}, chat_id, report_type)
+
+    # Формируем описание
     sched = config['schedule']
     if sched['type'] == 'interval_hours':
         details = f"Каждые {sched['hours']} ч, начиная с {sched['start_time']}"
@@ -546,7 +631,7 @@ async def _finalize_auto_report_common(chat_id, context, chat):
             details = f"Каждые {sched['days']} дн, начиная с {start_day_name} в {sched['time']}"
 
     await chat.send_message(
-        f"✅ Автоотчёт по всем маркетплейсам настроен!\n\n"
+        f"✅ Автоотчёт «{context.user_data['selected_report_label']}» настроен!\n\n"
         f"Интервал: {details}\n\n"
         f"Первый отчёт придёт по расписанию.",
         reply_markup=ReplyKeyboardRemove()

@@ -27,7 +27,6 @@ load_dotenv()
 from states import (
     SELECTING_ACTION,
     WB_REPORT_FILES,
-    WB_REMAINS_FILES,
     WB_REMAINS_CABINET_CHOICE,
     WB_REPORT_CABINET_CHOICE,
     OZON_REMAINS_CABINET_CHOICE,
@@ -43,7 +42,8 @@ from states import (
     AUTO_REPORT_WEEKLY_DAY,
     AUTO_REPORT_DAILY_TIME,
     AUTO_REPORT_START_TIME,
-    AUTO_REPORT_START_DAY
+    AUTO_REPORT_START_DAY,
+    SELECTING_AUTO_REPORT_TYPE
 )
 
 # Импортируем обработчики
@@ -91,7 +91,8 @@ from handlers.auto_report_handler import (
     handle_start_time_input,
     handle_start_day_choice,
     handle_back_from_time_input,
-    handle_back_from_start_time
+    handle_back_from_start_time,
+    handle_select_report_type
 )
 
 # Менеджер автоотчётов
@@ -281,6 +282,9 @@ def main() -> None:
             AUTO_REPORT_START_TIME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_start_time_input),
                 CallbackQueryHandler(handle_back_from_start_time)
+            ],
+            SELECTING_AUTO_REPORT_TYPE: [
+                CallbackQueryHandler(handle_select_report_type)
             ],
         },
         fallbacks=[CommandHandler('start', start)],
