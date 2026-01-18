@@ -1,5 +1,3 @@
-# main.py
-
 import os
 import logging
 import warnings
@@ -26,15 +24,16 @@ load_dotenv()
 # Импортируем состояния
 from states import (
     SELECTING_ACTION,
-    WB_REPORT_FILES,
     WB_REMAINS_CABINET_CHOICE,
-    WB_REPORT_CABINET_CHOICE,
     OZON_REMAINS_CABINET_CHOICE,
     BARCODE_FILES,
     CSV_FILES,
     OZON_SALES_CABINET_CHOICE,
     OZON_SALES_DATE_START,
     OZON_SALES_DATE_END,
+    WB_SALES_CABINET_CHOICE,
+    WB_SALES_DATE_START,
+    WB_SALES_DATE_END,
     ALL_MP_REMAINS,
     AUTO_REPORT_TOGGLE,
     AUTO_REPORT_FREQUENCY,
@@ -46,13 +45,6 @@ from states import (
     SELECTING_AUTO_REPORT_TYPE
 )
 
-# Импортируем обработчики
-from handlers.wb_handler import (
-    start_wb_report,
-    handle_wb_files,
-    generate_wb_report,
-    handle_wb_sales_cabinet_choice
-)
 from handlers.ozon_remains_handler import (
     start_ozon_remains,
     handle_cabinet_choice
@@ -76,6 +68,13 @@ from handlers.ozon_sales_handler import (
     handle_sales_cabinet_choice,
     handle_sales_date_start,
     handle_sales_date_end
+)
+# НОВЫЙ ОБРАБОТЧИК: продажи WB через API
+from handlers.wb_sales_handler import (
+    start_wb_sales,
+    handle_wb_sales_cabinet_choice as handle_wb_sales_cabinet_choice_api,
+    handle_wb_sales_date_start,
+    handle_wb_sales_date_end
 )
 from handlers.all_mp_remains_handler import (
     start_all_mp_remains,
@@ -102,7 +101,7 @@ from utils.auto_report_manager import schedule_all_jobs
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    force=True  # Перезаписывает настройки, если уже были
+    force=True
 )
 logger = logging.getLogger(__name__)
 
@@ -174,7 +173,7 @@ async def select_action(update: Update, context: CallbackContext) -> int:
     if text == "Продажи Ozon":
         return await start_ozon_sales(update, context)
     elif text == "Продажи WB":
-        return await start_wb_report(update, context)
+        return await start_wb_sales(update, context)  # ← Используем НОВЫЙ обработчик
     elif text == "Остатки товаров Ozon":
         return await start_ozon_remains(update, context)
     elif text == "Остатки товаров WB":
@@ -191,6 +190,7 @@ async def select_action(update: Update, context: CallbackContext) -> int:
         return await show_help(update, context)
     return SELECTING_ACTION
 
+
 # === ДЕБАГ: ЛОГИРОВАНИЕ ВСЕХ ОБНОВЛЕНИЙ ===
 async def debug_all_updates(update: Update, context: CallbackContext):
     logger.info(f"📥 ПОЛНЫЙ UPDATE: {update}")
@@ -200,19 +200,19 @@ async def debug_all_updates(update: Update, context: CallbackContext):
     if update.callback_query:
         logger.info(f"   Callback data: {update.callback_query.data}")
 
+
 def main() -> None:
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
         raise ValueError("❌ BOT_TOKEN не задан в .env")
 
-    # Включаем персистентность с явным указанием имени файла
     persistence = PicklePersistence(filepath="bot_conversation_data.pkl", update_interval=1)
     application = Application.builder().token(bot_token).persistence(persistence).build()
 
     # Загружаем сохранённые автоотчёты
     schedule_all_jobs(application)
 
-    # === ДОБАВЛЯЕМ ДЕБАГ-ЛОГГЕР (МОЖНО УДАЛИТЬ ПОТОМ) ===
+    # === ДЕБАГ-ЛОГГЕР (можно удалить в продакшене) ===
     application.add_handler(MessageHandler(filters.ALL, debug_all_updates), group=-1)
 
     # Основной диалог
@@ -227,26 +227,22 @@ def main() -> None:
                     '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Остатки на всех МП|Автоотчёты|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
                 ), select_action),
             ],
-            WB_REPORT_FILES: [
-                MessageHandler(filters.Document.FileExtension("xlsx"), handle_wb_files),
-                MessageHandler(filters.Text("Все файлы отправлены"), generate_wb_report),
-            ],
             WB_REMAINS_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_wb_cabinet_choice),
             ],
-            WB_REPORT_CABINET_CHOICE: [
-                CallbackQueryHandler(handle_wb_sales_cabinet_choice),
+            # Состояния для WB продаж через API
+            WB_SALES_CABINET_CHOICE: [
+                CallbackQueryHandler(handle_wb_sales_cabinet_choice_api),
             ],
+            WB_SALES_DATE_START: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wb_sales_date_start),
+            ],
+            WB_SALES_DATE_END: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wb_sales_date_end),
+            ],
+            # Состояния для Ozon продаж
             OZON_REMAINS_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_cabinet_choice),
-            ],
-            BARCODE_FILES: [
-                MessageHandler(filters.Document.FileExtension("xlsx"), handle_barcode_files),
-                MessageHandler(filters.Text("Все файлы отправлены"), generate_barcode_report),
-            ],
-            CSV_FILES: [
-                MessageHandler(filters.Document.FileExtension("csv"), handle_csv_files),
-                MessageHandler(filters.Text("Все файлы отправлены"), generate_xlsx_files),
             ],
             OZON_SALES_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_sales_cabinet_choice),
@@ -256,6 +252,15 @@ def main() -> None:
             ],
             OZON_SALES_DATE_END: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sales_date_end),
+            ],
+            # Прочие состояния
+            BARCODE_FILES: [
+                MessageHandler(filters.Document.FileExtension("xlsx"), handle_barcode_files),
+                MessageHandler(filters.Text("Все файлы отправлены"), generate_barcode_report),
+            ],
+            CSV_FILES: [
+                MessageHandler(filters.Document.FileExtension("csv"), handle_csv_files),
+                MessageHandler(filters.Text("Все файлы отправлены"), generate_xlsx_files),
             ],
             ALL_MP_REMAINS: [],
             # Состояния автоотчётов
@@ -273,7 +278,7 @@ def main() -> None:
             ],
             AUTO_REPORT_START_DAY: [
                 CallbackQueryHandler(handle_start_day_choice),
-                CallbackQueryHandler(handle_back_from_time_input)  # ← важно!
+                CallbackQueryHandler(handle_back_from_time_input)
             ],
             AUTO_REPORT_DAILY_TIME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_time_input),
@@ -299,6 +304,7 @@ def main() -> None:
     application.add_handler(conv_handler)
     logger.info("📡 Запуск в режиме polling")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == '__main__':
     main()
