@@ -21,6 +21,7 @@ warnings.filterwarnings("ignore", category=PTBUserWarning, message=".*per_messag
 # Загружаем переменные окружения
 load_dotenv()
 
+
 # Импортируем состояния
 from states import (
     SELECTING_ACTION,
@@ -69,7 +70,7 @@ from handlers.ozon_sales_handler import (
     handle_sales_date_start,
     handle_sales_date_end
 )
-# НОВЫЙ ОБРАБОТЧИК: продажи WB через API
+# ОБРАБОТЧИК: продажи WB через загрузку файлов (API не используется)
 from handlers.wb_sales_handler import (
     start_wb_sales,
     handle_wb_sales_cabinet_choice as handle_wb_sales_cabinet_choice_api,
@@ -98,12 +99,51 @@ from handlers.auto_report_handler import (
 from utils.auto_report_manager import schedule_all_jobs
 
 # Настройка логгирования
+log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+# Консольный обработчик
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter(log_format))
+
+# Файловый обработчик для всех логов
+file_handler = logging.FileHandler('../bot.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter(log_format))
+
+# Файловый обработчик для ошибок
+error_handler = logging.FileHandler('../bot.err', encoding='utf-8')
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(logging.Formatter(log_format))
+
+# Настройка корневого логгера
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
+    format=log_format,
+    handlers=[console_handler, file_handler, error_handler],
     force=True
 )
+
 logger = logging.getLogger(__name__)
+
+# Уменьшаем уровень логирования для httpx (чтобы не спамило HTTP запросами)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
+
+# Инициализация базы данных артикулов
+try:
+    from utils.database import get_database
+    db = get_database()
+    if db.needs_sync():
+        logger.info("🔄 Выполняется синхронизация базы данных с Excel...")
+        db.sync_from_excel()
+        logger.info("✅ База данных синхронизирована")
+    else:
+        logger.info("✅ База данных актуальна")
+except Exception as e:
+    logger.warning(f"⚠️ Ошибка инициализации базы данных: {e}")
+    logger.warning("Будет использоваться чтение напрямую из Excel")
 
 
 def get_main_menu():
@@ -201,19 +241,60 @@ async def debug_all_updates(update: Update, context: CallbackContext):
         logger.info(f"   Callback data: {update.callback_query.data}")
 
 
+async def error_handler(update: object, context: CallbackContext) -> None:
+    """Обработчик ошибок бота"""
+    error_message = str(context.error)
+
+    # Игнорируем ошибку конфликта (запущено несколько экземпляров)
+    # Это происходит когда старый процесс еще не завершился
+    if "Conflict" in error_message and "getUpdates" in error_message:
+        logger.warning(f"⚠️ Обнаружен конфликт подключений (возможно запущено несколько ботов). Игнорируем...")
+        return
+
+    # Игнорируем сетевые таймауты (это нормально)
+    if "TimedOut" in error_message or "Timed out" in error_message:
+        logger.debug(f"🔄 Таймаут сети (это нормально): {error_message}")
+        return
+
+    # Логируем остальные ошибки
+    logger.error(f"❌ Произошла ошибка: {context.error}", exc_info=context.error)
+
+    # Если есть update с сообщением от пользователя
+    if update and isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Произошла ошибка. Попробуйте /start для перезапуска."
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение об ошибке: {e}")
+
+
 def main() -> None:
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
         raise ValueError("❌ BOT_TOKEN не задан в .env")
 
-    persistence = PicklePersistence(filepath="bot_conversation_data.pkl", update_interval=1)
+    # Создаем персистентность с обработкой ошибок
+    persistence_file = "bot_conversation_data.pkl"
+    try:
+        persistence = PicklePersistence(filepath=persistence_file, update_interval=1)
+    except (TypeError, EOFError) as e:
+        logger.warning(f"⚠️ Файл персистентности поврежден, создаем новый: {e}")
+        # Удаляем поврежденный файл
+        if os.path.exists(persistence_file):
+            os.remove(persistence_file)
+            logger.info(f"Удален поврежденный файл: {persistence_file}")
+        # Создаем новый
+        persistence = PicklePersistence(filepath=persistence_file, update_interval=1)
+
     application = Application.builder().token(bot_token).persistence(persistence).build()
 
     # Загружаем сохранённые автоотчёты
     schedule_all_jobs(application)
 
-    # === ДЕБАГ-ЛОГГЕР (можно удалить в продакшене) ===
-    application.add_handler(MessageHandler(filters.ALL, debug_all_updates), group=-1)
+    # === ДЕБАГ-ЛОГГЕР (закомментирован для продакшена) ===
+    # Раскомментируйте следующую строку для подробного логирования всех обновлений
+    # application.add_handler(MessageHandler(filters.ALL, debug_all_updates), group=-1)
 
     # Основной диалог
     conv_handler = ConversationHandler(
@@ -230,12 +311,12 @@ def main() -> None:
             WB_REMAINS_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_wb_cabinet_choice),
             ],
-            # Состояния для WB продаж через API
+            # Состояния для WB продаж через загрузку файлов
             WB_SALES_CABINET_CHOICE: [
                 CallbackQueryHandler(handle_wb_sales_cabinet_choice_api),
             ],
             WB_SALES_DATE_START: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wb_sales_date_start),
+                MessageHandler(filters.Document.ALL, handle_wb_sales_date_start),
             ],
             WB_SALES_DATE_END: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wb_sales_date_end),
@@ -302,6 +383,10 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
+
+    # Регистрируем обработчик ошибок
+    application.add_error_handler(error_handler)
+
     logger.info("📡 Запуск в режиме polling")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
