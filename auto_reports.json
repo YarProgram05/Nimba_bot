@@ -5,7 +5,7 @@
       "schedule": {
         "type": "interval_hours",
         "hours": 1,
-        "start_time": "15:13"
+        "start_time": "22:27"
       }
     }
   }

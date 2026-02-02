@@ -145,3 +145,36 @@ def get_cabinet_articles_by_template_id(sheet_name):
     except Exception as e:
         logger.error(f"Ошибка в get_cabinet_articles_by_template_id для листа {sheet_name}: {e}")
         return {}, {}
+
+
+def get_template_order(sheet_name):
+    """
+    Возвращает список template_id в порядке следования строк в Excel.
+    Используется для сохранения порядка "как в базе" в отчетах.
+    """
+    try:
+        template_path = "База данных артикулов для выкупов и начислений.xlsx"
+        if not os.path.exists(template_path):
+            template_path = os.path.join(os.path.dirname(__file__), "..",
+                                         "База данных артикулов для выкупов и начислений.xlsx")
+
+        df = pd.read_excel(template_path, sheet_name=sheet_name)
+        main_ids_ordered = []
+        seen = set()
+
+        for _, row in df.iterrows():
+            if not pd.isna(row.get('ID')):
+                tid = int(row['ID'])
+                if tid not in seen:
+                    main_ids_ordered.append(tid)
+                    seen.add(tid)
+            elif not pd.isna(row.get('ID_mix')):
+                tid_mix = int(row['ID_mix'])
+                if tid_mix not in seen:
+                    main_ids_ordered.append(tid_mix)
+                    seen.add(tid_mix)
+
+        return main_ids_ordered
+    except Exception as e:
+        logger.error(f"Ошибка при получении порядка ID для листа {sheet_name}: {e}")
+        return []

@@ -31,6 +31,7 @@ from states import WB_SALES_CABINET_CHOICE, WB_SALES_DATE_START, WB_SALES_DATE_E
 
 # Импорт функции для работы с шаблоном
 from utils.template_loader import get_cabinet_articles_by_template_id
+from utils.template_loader import get_template_order
 
 
 def extract_period_from_filename(filename):
@@ -64,6 +65,8 @@ def get_wb_api_token(cabinet_id):
         token = os.getenv('WB_API_TOKEN_1')
     elif cabinet_id == 2:
         token = os.getenv('WB_API_TOKEN_2')
+    elif cabinet_id == 3:
+        token = os.getenv('WB_API_TOKEN_3')
     else:
         raise ValueError(f"Неподдерживаемый cabinet_id: {cabinet_id}")
 
@@ -242,7 +245,8 @@ async def start_wb_sales(update: Update, context: CallbackContext) -> int:
 
     keyboard = [
         [InlineKeyboardButton("🏪 WB_1 Nimba", callback_data='wb_cabinet_1')],
-        [InlineKeyboardButton("🏬 WB_2 Galioni", callback_data='wb_cabinet_2')]
+        [InlineKeyboardButton("🏬 WB_2 Galioni", callback_data='wb_cabinet_2')],
+        [InlineKeyboardButton("🏢 WB_3 AGNIA", callback_data='wb_cabinet_3')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -262,11 +266,16 @@ async def handle_wb_sales_cabinet_choice(update: Update, context: CallbackContex
     await query.answer()
 
     cabinet_data = query.data
-    if cabinet_data not in ('wb_cabinet_1', 'wb_cabinet_2'):
+    cabinet_map = {
+        'wb_cabinet_1': 1,
+        'wb_cabinet_2': 2,
+        'wb_cabinet_3': 3
+    }
+    if cabinet_data not in cabinet_map:
         await query.message.reply_text("❌ Неизвестный кабинет.")
         return ConversationHandler.END
 
-    cabinet_id = 1 if cabinet_data == 'wb_cabinet_1' else 2
+    cabinet_id = cabinet_map[cabinet_data]
     context.user_data['wb_sales_cabinet_id'] = cabinet_id
 
     await query.message.edit_reply_markup(reply_markup=None)
@@ -412,7 +421,19 @@ async def handle_wb_sales_date_end(update: Update, context: CallbackContext) -> 
             )
 
         # === 3. Загружаем шаблон артикулов ===
-        template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id("Шаблон_WB")
+        sheet_map = {
+            1: "Отдельно ВБ Nimba",
+            2: "Отдельно ВБ Galioni",
+            3: "Отдельно ВБ AGNIA"
+        }
+        sheet_name = sheet_map.get(cabinet_id)
+        if not sheet_name:
+            raise ValueError(f"Неподдерживаемый кабинет WB: {cabinet_id}")
+
+        template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id(sheet_name)
+        main_ids_ordered = get_template_order(sheet_name)
+        if not main_ids_ordered:
+            main_ids_ordered = sorted(template_id_to_name.keys())
 
         # === 4. Распределяем общие расходы пропорционально доходу ===
         total_income_sum = sum(income_data.values())
@@ -490,7 +511,7 @@ async def handle_wb_sales_date_end(update: Update, context: CallbackContext) -> 
 
         create_wb_excel_report_v2(
             grouped, unmatched, template_id_to_name,
-            sorted(template_id_to_name.keys()),
+            main_ids_ordered,
             output_path,
             total_orders, total_purchases, total_cancels,
             total_income, total_payout_final,
@@ -993,7 +1014,7 @@ def create_wb_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, out
     row_index = 2
     for group_id in main_ids_ordered:
         data = grouped.get(group_id, {})
-        name = data.get('name', f"Группа {group_id}")
+        name = data.get('name') or id_to_name.get(group_id, f"ID {group_id}")
         orders = int(data.get('orders', 0))
         purchases = int(data.get('purchases', 0))
         cancels = int(data.get('cancels', 0))
@@ -1250,7 +1271,7 @@ def create_wb_excel_report_v2(grouped, unmatched, id_to_name, main_ids_ordered, 
     row_index = 2
     for group_id in main_ids_ordered:
         data = grouped.get(group_id, {})
-        name = data.get('name', f"Группа {group_id}")
+        name = data.get('name') or id_to_name.get(group_id, f"ID {group_id}")
         orders = int(data.get('orders', 0))
         purchases = int(data.get('purchases', 0))
         cancels = int(data.get('cancels', 0))
@@ -1389,4 +1410,3 @@ def create_wb_excel_report_v2(grouped, unmatched, id_to_name, main_ids_ordered, 
             ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
 
     wb.save(output_path)
-

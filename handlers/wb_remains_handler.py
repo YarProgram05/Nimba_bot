@@ -53,8 +53,10 @@ class WildberriesAPI:
             self.api_token = os.getenv('WB_API_TOKEN_1')
         elif cabinet_id == 2:
             self.api_token = os.getenv('WB_API_TOKEN_2')
+        elif cabinet_id == 3:
+            self.api_token = os.getenv('WB_API_TOKEN_3')
         else:
-            raise ValueError("Поддерживаются только cabinet_id 1 или 2")
+            raise ValueError("Поддерживаются только cabinet_id 1, 2 или 3")
 
         if not self.api_token:
             raise ValueError(f"❌ WB_API_TOKEN не задан в .env для кабинета {cabinet_id}")
@@ -188,7 +190,8 @@ async def start_wb_remains(update: Update, context: CallbackContext) -> int:
 
     keyboard = [
         [InlineKeyboardButton("🏪 WB_1 Nimba", callback_data='wb_cabinet_1')],
-        [InlineKeyboardButton("🏬 WB_2 Galioni", callback_data='wb_cabinet_2')]
+        [InlineKeyboardButton("🏬 WB_2 Galioni", callback_data='wb_cabinet_2')],
+        [InlineKeyboardButton("🏢 WB_3 AGNIA", callback_data='wb_cabinet_3')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -214,6 +217,10 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         cabinet_id = 2
         cabinet_name = "WB_2 Galioni"
         sheet_name = "Отдельно ВБ Galioni"
+    elif cabinet_data == 'wb_cabinet_3':
+        cabinet_id = 3
+        cabinet_name = "WB_3 AGNIA"
+        sheet_name = "Отдельно ВБ AGNIA"
     else:
         await query.message.reply_text("❌ Неизвестный кабинет.")
         return ConversationHandler.END

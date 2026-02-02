@@ -348,6 +348,10 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         status_message_ids.append(status_msg.message_id)
         ozon2_raw_dict, ozon2_raw_data = await fetch_ozon_remains_raw(2)
 
+        status_msg = await update.message.reply_text("📊 Запрашиваю остатки Ozon Кабинет 3 (AGNIA)...")
+        status_message_ids.append(status_msg.message_id)
+        ozon3_raw_dict, ozon3_raw_data = await fetch_ozon_remains_raw(3)
+
         status_msg = await update.message.reply_text("📊 Запрашиваю остатки Wildberries Кабинет 1 (Nimba)...")
         status_message_ids.append(status_msg.message_id)
         wb1_raw_dict, wb1_raw_data = await fetch_wb_remains_raw(1)
@@ -356,13 +360,19 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         status_message_ids.append(status_msg.message_id)
         wb2_raw_dict, wb2_raw_data = await fetch_wb_remains_raw(2)
 
+        status_msg = await update.message.reply_text("📊 Запрашиваю остатки Wildberries Кабинет 3 (AGNIA)...")
+        status_message_ids.append(status_msg.message_id)
+        wb3_raw_dict, wb3_raw_data = await fetch_wb_remains_raw(3)
+
         # === 2. Загружаем маппинги ===
         from utils.template_loader import get_cabinet_articles_by_template_id
 
         ozon1_id_to_name, ozon1_id_to_arts = get_cabinet_articles_by_template_id("Отдельно Озон Nimba")
         ozon2_id_to_name, ozon2_id_to_arts = get_cabinet_articles_by_template_id("Отдельно Озон Galioni")
+        ozon3_id_to_name, ozon3_id_to_arts = get_cabinet_articles_by_template_id("Отдельно Озон AGNIA")
         wb1_id_to_name, wb1_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ Nimba")
         wb2_id_to_name, wb2_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ Galioni")
+        wb3_id_to_name, wb3_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ AGNIA")
 
         # === 3. Построим обратные маппинги ===
         def build_reverse(id_to_arts):
@@ -375,8 +385,10 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
 
         ozon1_rev = build_reverse(ozon1_id_to_arts)
         ozon2_rev = build_reverse(ozon2_id_to_arts)
+        ozon3_rev = build_reverse(ozon3_id_to_arts)
         wb1_rev = build_reverse(wb1_id_to_arts)
         wb2_rev = build_reverse(wb2_id_to_arts)
+        wb3_rev = build_reverse(wb3_id_to_arts)
 
         # === 4. Агрегация данных ===
         ozon1_agg = {}
@@ -401,6 +413,17 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
                 ozon2_agg[tid]['return'] += data['return']
                 ozon2_agg[tid]['prep'] += data['prep']
 
+        ozon3_agg = {}
+        for art, data in ozon3_raw_dict.items():
+            clean_art = normalize_art(art)
+            tid = ozon3_rev.get(clean_art)
+            if tid is not None:
+                if tid not in ozon3_agg:
+                    ozon3_agg[tid] = {'avail': 0, 'return': 0, 'prep': 0}
+                ozon3_agg[tid]['avail'] += data['avail']
+                ozon3_agg[tid]['return'] += data['return']
+                ozon3_agg[tid]['prep'] += data['prep']
+
         wb1_agg = {}
         for art, data in wb1_raw_dict.items():
             clean_art = normalize_art(art)
@@ -422,6 +445,17 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
                 wb2_agg[tid]['avail'] += data['avail']
                 wb2_agg[tid]['return'] += data['return']
                 wb2_agg[tid]['inway'] += data['inway']
+
+        wb3_agg = {}
+        for art, data in wb3_raw_dict.items():
+            clean_art = normalize_art(art)
+            tid = wb3_rev.get(clean_art)
+            if tid is not None:
+                if tid not in wb3_agg:
+                    wb3_agg[tid] = {'avail': 0, 'return': 0, 'inway': 0}
+                wb3_agg[tid]['avail'] += data['avail']
+                wb3_agg[tid]['return'] += data['return']
+                wb3_agg[tid]['inway'] += data['inway']
 
         # === 5. РАБОТА С ШАБЛОНОМ - ПОЛНОЕ КОПИРОВАНИЕ ===
         template_report_path = os.path.join(root_dir, "Шаблон выгрузки остатков всех МП.xlsx")
@@ -448,7 +482,14 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
 
             # Ищем template_id по имени во ВСЕХ кабинетах
             template_id = None
-            all_id_to_name = [ozon1_id_to_name, ozon2_id_to_name, wb1_id_to_name, wb2_id_to_name]
+            all_id_to_name = [
+                ozon1_id_to_name,
+                ozon2_id_to_name,
+                ozon3_id_to_name,
+                wb1_id_to_name,
+                wb2_id_to_name,
+                wb3_id_to_name
+            ]
 
             for id_to_name in all_id_to_name:
                 for tid, name in id_to_name.items():
@@ -473,19 +514,33 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
                 ws[f"I{row}"] = o2['prep']
                 ws[f"J{row}"] = o2['avail'] + o2['return'] + o2['prep']
 
+                # --- Ozon 3 ---
+                o3 = ozon3_agg.get(template_id, {'avail': 0, 'return': 0, 'prep': 0})
+                ws[f"L{row}"] = o3['avail']
+                ws[f"M{row}"] = o3['return']
+                ws[f"N{row}"] = o3['prep']
+                ws[f"O{row}"] = o3['avail'] + o3['return'] + o3['prep']
+
                 # --- WB 1 ---
                 w1 = wb1_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
-                ws[f"L{row}"] = w1['avail']
-                ws[f"M{row}"] = w1['return']
-                ws[f"N{row}"] = w1['inway']
-                ws[f"O{row}"] = w1['avail'] + w1['return'] + w1['inway']
+                ws[f"Q{row}"] = w1['avail']
+                ws[f"R{row}"] = w1['return']
+                ws[f"S{row}"] = w1['inway']
+                ws[f"T{row}"] = w1['avail'] + w1['return'] + w1['inway']
 
                 # --- WB 2 ---
                 w2 = wb2_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
-                ws[f"Q{row}"] = w2['avail']
-                ws[f"R{row}"] = w2['return']
-                ws[f"S{row}"] = w2['inway']
-                ws[f"T{row}"] = w2['avail'] + w2['return'] + w2['inway']
+                ws[f"V{row}"] = w2['avail']
+                ws[f"W{row}"] = w2['return']
+                ws[f"X{row}"] = w2['inway']
+                ws[f"Y{row}"] = w2['avail'] + w2['return'] + w2['inway']
+
+                # --- WB 3 ---
+                w3 = wb3_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
+                ws[f"AA{row}"] = w3['avail']
+                ws[f"AB{row}"] = w3['return']
+                ws[f"AC{row}"] = w3['inway']
+                ws[f"AD{row}"] = w3['avail'] + w3['return'] + w3['inway']
 
             row += 1
 
@@ -515,6 +570,18 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
             ws_ozon2 = wb.create_sheet(title="Ozon2 исходные артикулы")
             ws_ozon2.append(["Нет данных"])
 
+        # Ozon3 исходные артикулы
+        if ozon3_raw_data:
+            df_ozon3_raw = pd.DataFrame(ozon3_raw_data).sort_values(by='Наименование',
+                                                                    key=lambda x: x.str.lower()).reset_index(drop=True)
+            headers_ozon3 = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                             "Подготовка к продаже", "Итого на МП"]
+            ws_ozon3 = wb.create_sheet(title="Ozon AGNIA исходные артикулы")
+            _write_sheet(ws_ozon3, df_ozon3_raw, headers_ozon3, has_name=True)
+        else:
+            ws_ozon3 = wb.create_sheet(title="Ozon AGNIA исходные артикулы")
+            ws_ozon3.append(["Нет данных"])
+
         # WB1 исходные артикулы
         if wb1_raw_data:
             df_wb1_raw = pd.DataFrame(wb1_raw_data).sort_values(by='Артикул').reset_index(drop=True)
@@ -537,6 +604,17 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
             ws_wb2 = wb.create_sheet(title="WB2 исходные артикулы")
             ws_wb2.append(["Нет данных"])
 
+        # WB3 исходные артикулы
+        if wb3_raw_data:
+            df_wb3_raw = pd.DataFrame(wb3_raw_data).sort_values(by='Артикул').reset_index(drop=True)
+            headers_wb3 = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
+                           "Итого на МП"]
+            ws_wb3 = wb.create_sheet(title="WB AGNIA исходные артикулы")
+            _write_sheet(ws_wb3, df_wb3_raw, headers_wb3, has_name=False)
+        else:
+            ws_wb3 = wb.create_sheet(title="WB AGNIA исходные артикулы")
+            ws_wb3.append(["Нет данных"])
+
         wb.save(report_copy)
 
         # === РАСЧЁТ СВОДНЫХ ДАННЫХ ПО ВСЕМ КАБИНЕТАМ ===
@@ -553,6 +631,12 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         ozon2_total_prep = sum(data['prep'] for data in ozon2_raw_dict.values())
         ozon2_total_mp = ozon2_total_avail + ozon2_total_return + ozon2_total_prep
 
+        # Ozon 3
+        ozon3_total_avail = sum(data['avail'] for data in ozon3_raw_dict.values())
+        ozon3_total_return = sum(data['return'] for data in ozon3_raw_dict.values())
+        ozon3_total_prep = sum(data['prep'] for data in ozon3_raw_dict.values())
+        ozon3_total_mp = ozon3_total_avail + ozon3_total_return + ozon3_total_prep
+
         # WB 1
         wb1_total_avail = sum(data['avail'] for data in wb1_raw_dict.values())
         wb1_total_return = sum(data['return'] for data in wb1_raw_dict.values())
@@ -565,8 +649,17 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         wb2_total_inway = sum(data['inway'] for data in wb2_raw_dict.values())
         wb2_total_mp = wb2_total_avail + wb2_total_return + wb2_total_inway
 
+        # WB 3
+        wb3_total_avail = sum(data['avail'] for data in wb3_raw_dict.values())
+        wb3_total_return = sum(data['return'] for data in wb3_raw_dict.values())
+        wb3_total_inway = sum(data['inway'] for data in wb3_raw_dict.values())
+        wb3_total_mp = wb3_total_avail + wb3_total_return + wb3_total_inway
+
         # Общая сумма по всем маркетплейсам
-        total_all_mp = ozon1_total_mp + ozon2_total_mp + wb1_total_mp + wb2_total_mp
+        total_all_mp = (
+            ozon1_total_mp + ozon2_total_mp + ozon3_total_mp +
+            wb1_total_mp + wb2_total_mp + wb3_total_mp
+        )
 
         def fmt(x):
             return f"{x:,}".replace(",", " ")
@@ -587,6 +680,12 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
             f"   🔄 Подготовка к продаже: {fmt(ozon2_total_prep)} шт\n"
             f"   ✅ Итого на МП: {fmt(ozon2_total_mp)} шт\n\n"
 
+            "🏢 <b>Ozon Кабинет 3 (AGNIA)</b>\n"
+            f"   📦 Доступно на складах: {fmt(ozon3_total_avail)} шт\n"
+            f"   ↩️ Возвращаются от покупателей: {fmt(ozon3_total_return)} шт\n"
+            f"   🔄 Подготовка к продаже: {fmt(ozon3_total_prep)} шт\n"
+            f"   ✅ Итого на МП: {fmt(ozon3_total_mp)} шт\n\n"
+
             "🏪 <b>Wildberries Кабинет 1 (Nimba)</b>\n"
             f"   📦 Доступно на складах: {fmt(wb1_total_avail)} шт\n"
             f"   ↩️ Возвращаются от покупателей: {fmt(wb1_total_return)} шт\n"
@@ -598,6 +697,12 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
             f"   ↩️ Возвращаются от покупателей: {fmt(wb2_total_return)} шт\n"
             f"   🚚 В пути до покупателей: {fmt(wb2_total_inway)} шт\n"
             f"   ✅ Итого на МП: {fmt(wb2_total_mp)} шт\n\n"
+
+            "🏢 <b>Wildberries Кабинет 3 (AGNIA)</b>\n"
+            f"   📦 Доступно на складах: {fmt(wb3_total_avail)} шт\n"
+            f"   ↩️ Возвращаются от покупателей: {fmt(wb3_total_return)} шт\n"
+            f"   🚚 В пути до покупателей: {fmt(wb3_total_inway)} шт\n"
+            f"   ✅ Итого на МП: {fmt(wb3_total_mp)} шт\n\n"
 
             f"🔹 <b>ВСЕГО на всех маркетплейсах:</b> {fmt(total_all_mp)} шт"
         )
@@ -686,16 +791,20 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
         # === 1. Получаем сырые данные ===
         ozon1_raw_dict, ozon1_raw_data = await fetch_ozon_remains_raw(1)
         ozon2_raw_dict, ozon2_raw_data = await fetch_ozon_remains_raw(2)
+        ozon3_raw_dict, ozon3_raw_data = await fetch_ozon_remains_raw(3)
         wb1_raw_dict, wb1_raw_data = await fetch_wb_remains_raw(1)
         wb2_raw_dict, wb2_raw_data = await fetch_wb_remains_raw(2)
+        wb3_raw_dict, wb3_raw_data = await fetch_wb_remains_raw(3)
 
         # === 2–5. (всё остальное без изменений — копируем твой существующий код) ===
         from utils.template_loader import get_cabinet_articles_by_template_id
 
         ozon1_id_to_name, ozon1_id_to_arts = get_cabinet_articles_by_template_id("Отдельно Озон Nimba")
         ozon2_id_to_name, ozon2_id_to_arts = get_cabinet_articles_by_template_id("Отдельно Озон Galioni")
+        ozon3_id_to_name, ozon3_id_to_arts = get_cabinet_articles_by_template_id("Отдельно Озон AGNIA")
         wb1_id_to_name, wb1_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ Nimba")
         wb2_id_to_name, wb2_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ Galioni")
+        wb3_id_to_name, wb3_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ AGNIA")
 
         def build_reverse(id_to_arts):
             rev = {}
@@ -707,8 +816,10 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
 
         ozon1_rev = build_reverse(ozon1_id_to_arts)
         ozon2_rev = build_reverse(ozon2_id_to_arts)
+        ozon3_rev = build_reverse(ozon3_id_to_arts)
         wb1_rev = build_reverse(wb1_id_to_arts)
         wb2_rev = build_reverse(wb2_id_to_arts)
+        wb3_rev = build_reverse(wb3_id_to_arts)
 
         ozon1_agg = {}
         for art, data in ozon1_raw_dict.items():
@@ -732,6 +843,17 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
                 ozon2_agg[tid]['return'] += data['return']
                 ozon2_agg[tid]['prep'] += data['prep']
 
+        ozon3_agg = {}
+        for art, data in ozon3_raw_dict.items():
+            clean_art = normalize_art(art)
+            tid = ozon3_rev.get(clean_art)
+            if tid is not None:
+                if tid not in ozon3_agg:
+                    ozon3_agg[tid] = {'avail': 0, 'return': 0, 'prep': 0}
+                ozon3_agg[tid]['avail'] += data['avail']
+                ozon3_agg[tid]['return'] += data['return']
+                ozon3_agg[tid]['prep'] += data['prep']
+
         wb1_agg = {}
         for art, data in wb1_raw_dict.items():
             clean_art = normalize_art(art)
@@ -754,6 +876,17 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
                 wb2_agg[tid]['return'] += data['return']
                 wb2_agg[tid]['inway'] += data['inway']
 
+        wb3_agg = {}
+        for art, data in wb3_raw_dict.items():
+            clean_art = normalize_art(art)
+            tid = wb3_rev.get(clean_art)
+            if tid is not None:
+                if tid not in wb3_agg:
+                    wb3_agg[tid] = {'avail': 0, 'return': 0, 'inway': 0}
+                wb3_agg[tid]['avail'] += data['avail']
+                wb3_agg[tid]['return'] += data['return']
+                wb3_agg[tid]['inway'] += data['inway']
+
         template_report_path = os.path.join(root_dir, "Шаблон выгрузки остатков всех МП.xlsx")
         if not os.path.exists(template_report_path):
             raise FileNotFoundError("Файл 'Шаблон выгрузки остатков всех МП.xlsx' не найден!")
@@ -772,7 +905,14 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
 
             art_name = str(cell_value).strip()
             template_id = None
-            all_id_to_name = [ozon1_id_to_name, ozon2_id_to_name, wb1_id_to_name, wb2_id_to_name]
+            all_id_to_name = [
+                ozon1_id_to_name,
+                ozon2_id_to_name,
+                ozon3_id_to_name,
+                wb1_id_to_name,
+                wb2_id_to_name,
+                wb3_id_to_name
+            ]
 
             for id_to_name in all_id_to_name:
                 for tid, name in id_to_name.items():
@@ -795,17 +935,29 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
                 ws[f"I{row}"] = o2['prep']
                 ws[f"J{row}"] = o2['avail'] + o2['return'] + o2['prep']
 
+                o3 = ozon3_agg.get(template_id, {'avail': 0, 'return': 0, 'prep': 0})
+                ws[f"L{row}"] = o3['avail']
+                ws[f"M{row}"] = o3['return']
+                ws[f"N{row}"] = o3['prep']
+                ws[f"O{row}"] = o3['avail'] + o3['return'] + o3['prep']
+
                 w1 = wb1_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
-                ws[f"L{row}"] = w1['avail']
-                ws[f"M{row}"] = w1['return']
-                ws[f"N{row}"] = w1['inway']
-                ws[f"O{row}"] = w1['avail'] + w1['return'] + w1['inway']
+                ws[f"Q{row}"] = w1['avail']
+                ws[f"R{row}"] = w1['return']
+                ws[f"S{row}"] = w1['inway']
+                ws[f"T{row}"] = w1['avail'] + w1['return'] + w1['inway']
 
                 w2 = wb2_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
-                ws[f"Q{row}"] = w2['avail']
-                ws[f"R{row}"] = w2['return']
-                ws[f"S{row}"] = w2['inway']
-                ws[f"T{row}"] = w2['avail'] + w2['return'] + w2['inway']
+                ws[f"V{row}"] = w2['avail']
+                ws[f"W{row}"] = w2['return']
+                ws[f"X{row}"] = w2['inway']
+                ws[f"Y{row}"] = w2['avail'] + w2['return'] + w2['inway']
+
+                w3 = wb3_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
+                ws[f"AA{row}"] = w3['avail']
+                ws[f"AB{row}"] = w3['return']
+                ws[f"AC{row}"] = w3['inway']
+                ws[f"AD{row}"] = w3['avail'] + w3['return'] + w3['inway']
 
             row += 1
 
@@ -832,6 +984,17 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
             ws_ozon2 = wb.create_sheet(title="Ozon2 исходные артикулы")
             ws_ozon2.append(["Нет данных"])
 
+        if ozon3_raw_data:
+            df_ozon3_raw = pd.DataFrame(ozon3_raw_data).sort_values(by='Наименование',
+                                                                    key=lambda x: x.str.lower()).reset_index(drop=True)
+            ws_ozon3 = wb.create_sheet(title="Ozon AGNIA исходные артикулы")
+            _write_sheet(ws_ozon3, df_ozon3_raw,
+                         ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                          "Подготовка к продаже", "Итого на МП"], has_name=True)
+        else:
+            ws_ozon3 = wb.create_sheet(title="Ozon AGNIA исходные артикулы")
+            ws_ozon3.append(["Нет данных"])
+
         if wb1_raw_data:
             df_wb1_raw = pd.DataFrame(wb1_raw_data).sort_values(by='Артикул').reset_index(drop=True)
             ws_wb1 = wb.create_sheet(title="WB1 исходные артикулы")
@@ -852,6 +1015,16 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
             ws_wb2 = wb.create_sheet(title="WB2 исходные артикулы")
             ws_wb2.append(["Нет данных"])
 
+        if wb3_raw_data:
+            df_wb3_raw = pd.DataFrame(wb3_raw_data).sort_values(by='Артикул').reset_index(drop=True)
+            ws_wb3 = wb.create_sheet(title="WB AGNIA исходные артикулы")
+            _write_sheet(ws_wb3, df_wb3_raw,
+                         ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
+                          "Итого на МП"], has_name=False)
+        else:
+            ws_wb3 = wb.create_sheet(title="WB AGNIA исходные артикулы")
+            ws_wb3.append(["Нет данных"])
+
         wb.save(report_copy)
 
         # === СВОДКА ===
@@ -865,6 +1038,11 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
         ozon2_total_prep = sum(data['prep'] for data in ozon2_raw_dict.values())
         ozon2_total_mp = ozon2_total_avail + ozon2_total_return + ozon2_total_prep
 
+        ozon3_total_avail = sum(data['avail'] for data in ozon3_raw_dict.values())
+        ozon3_total_return = sum(data['return'] for data in ozon3_raw_dict.values())
+        ozon3_total_prep = sum(data['prep'] for data in ozon3_raw_dict.values())
+        ozon3_total_mp = ozon3_total_avail + ozon3_total_return + ozon3_total_prep
+
         wb1_total_avail = sum(data['avail'] for data in wb1_raw_dict.values())
         wb1_total_return = sum(data['return'] for data in wb1_raw_dict.values())
         wb1_total_inway = sum(data['inway'] for data in wb1_raw_dict.values())
@@ -875,7 +1053,15 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
         wb2_total_inway = sum(data['inway'] for data in wb2_raw_dict.values())
         wb2_total_mp = wb2_total_avail + wb2_total_return + wb2_total_inway
 
-        total_all_mp = ozon1_total_mp + ozon2_total_mp + wb1_total_mp + wb2_total_mp
+        wb3_total_avail = sum(data['avail'] for data in wb3_raw_dict.values())
+        wb3_total_return = sum(data['return'] for data in wb3_raw_dict.values())
+        wb3_total_inway = sum(data['inway'] for data in wb3_raw_dict.values())
+        wb3_total_mp = wb3_total_avail + wb3_total_return + wb3_total_inway
+
+        total_all_mp = (
+            ozon1_total_mp + ozon2_total_mp + ozon3_total_mp +
+            wb1_total_mp + wb2_total_mp + wb3_total_mp
+        )
 
         def fmt(x):
             return f"{x:,}".replace(",", " ")
@@ -897,6 +1083,12 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
             f"   🔄 Подготовка к продаже: {fmt(ozon2_total_prep)} шт\n"
             f"   ✅ Итого на МП: {fmt(ozon2_total_mp)} шт\n\n"
 
+            f"🏢 <b>Ozon Кабинет 3 (AGNIA)</b>\n"
+            f"   📦 Доступно на складах: {fmt(ozon3_total_avail)} шт\n"
+            f"   ↩️ Возвращаются от покупателей: {fmt(ozon3_total_return)} шт\n"
+            f"   🔄 Подготовка к продаже: {fmt(ozon3_total_prep)} шт\n"
+            f"   ✅ Итого на МП: {fmt(ozon3_total_mp)} шт\n\n"
+
             f"🏪 <b>Wildberries Кабинет 1 (Nimba)</b>\n"
             f"   📦 Доступно на складах: {fmt(wb1_total_avail)} шт\n"
             f"   ↩️ Возвращаются от покупателей: {fmt(wb1_total_return)} шт\n"
@@ -908,6 +1100,12 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
             f"   ↩️ Возвращаются от покупателей: {fmt(wb2_total_return)} шт\n"
             f"   🚚 В пути до покупателей: {fmt(wb2_total_inway)} шт\n"
             f"   ✅ Итого на МП: {fmt(wb2_total_mp)} шт\n\n"
+
+            f"🏢 <b>Wildberries Кабинет 3 (AGNIA)</b>\n"
+            f"   📦 Доступно на складах: {fmt(wb3_total_avail)} шт\n"
+            f"   ↩️ Возвращаются от покупателей: {fmt(wb3_total_return)} шт\n"
+            f"   🚚 В пути до покупателей: {fmt(wb3_total_inway)} шт\n"
+            f"   ✅ Итого на МП: {fmt(wb3_total_mp)} шт\n\n"
 
             f"🔹 <b>ВСЕГО на всех маркетплейсах:</b> {fmt(total_all_mp)} шт"
         )

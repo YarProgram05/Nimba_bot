@@ -43,8 +43,11 @@ class OzonAPI:
         elif cabinet_id == 2:
             self.client_id = os.getenv('OZON_CLIENT_ID_2')
             self.api_key = os.getenv('OZON_API_KEY_2')
+        elif cabinet_id == 3:
+            self.client_id = os.getenv('OZON_CLIENT_ID_3')
+            self.api_key = os.getenv('OZON_API_KEY_3')
         else:
-            raise ValueError("Поддерживаются только cabinet_id 1 или 2")
+            raise ValueError("Поддерживаются только cabinet_id 1, 2 или 3")
 
         if not self.client_id or not self.api_key:
             raise ValueError(f"❌ OZON_CLIENT_ID или OZON_API_KEY не заданы в .env для кабинета {cabinet_id}")
@@ -204,7 +207,8 @@ async def start_ozon_remains(update: Update, context: CallbackContext) -> int:
 
     keyboard = [
         [InlineKeyboardButton("🏪 Озон_1 Nimba", callback_data='cabinet_1')],
-        [InlineKeyboardButton("🏬 Озон_2 Galioni", callback_data='cabinet_2')]
+        [InlineKeyboardButton("🏬 Озон_2 Galioni", callback_data='cabinet_2')],
+        [InlineKeyboardButton("🏢 Озон_3 AGNIA", callback_data='cabinet_3')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -222,7 +226,16 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
     await query.answer()
 
     cabinet_data = query.data
-    cabinet_id = 1 if cabinet_data == 'cabinet_1' else 2
+    cabinet_map = {
+        'cabinet_1': 1,
+        'cabinet_2': 2,
+        'cabinet_3': 3
+    }
+    if cabinet_data not in cabinet_map:
+        await query.message.reply_text("❌ Неизвестный кабинет.")
+        return ConversationHandler.END
+
+    cabinet_id = cabinet_map[cabinet_data]
     context.user_data['ozon_cabinet_id'] = cabinet_id
 
     loading_message = await query.message.edit_text(f"⏳ Получаю остатки с Ozon API (Озон {cabinet_id})...")
@@ -356,7 +369,14 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                        "Подготовка к продаже", "Итого на МП"]
 
         # === 2. Отчёт по шаблону Nimba/Galioni ===
-        sheet_name = "Отдельно Озон Nimba" if cabinet_id == 1 else "Отдельно Озон Galioni"
+        sheet_map = {
+            1: "Отдельно Озон Nimba",
+            2: "Отдельно Озон Galioni",
+            3: "Отдельно Озон AGNIA"
+        }
+        sheet_name = sheet_map.get(cabinet_id)
+        if not sheet_name:
+            raise ValueError(f"Неподдерживаемый кабинет Ozon: {cabinet_id}")
 
         template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id(sheet_name)
 
