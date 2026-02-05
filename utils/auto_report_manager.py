@@ -8,7 +8,13 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
-AUTO_REPORTS_FILE = "auto_reports.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))
+AUTO_REPORTS_FILE = os.path.join(DATA_DIR, "auto_reports.json")
+
+
+def _ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 
 def get_next_weekday_at_time(target_weekday, target_time, tz):
@@ -60,6 +66,7 @@ def get_next_interval_day(start_day, interval_days, target_time, tz):
 # utils/auto_report_manager.py
 
 def load_auto_reports():
+    _ensure_data_dir()
     if os.path.exists(AUTO_REPORTS_FILE):
         try:
             with open(AUTO_REPORTS_FILE, 'r', encoding='utf-8') as f:
@@ -71,6 +78,7 @@ def load_auto_reports():
 
 
 def save_auto_reports(reports):
+    _ensure_data_dir()
     try:
         with open(AUTO_REPORTS_FILE, 'w', encoding='utf-8') as f:
             json.dump(reports, f, indent=2, ensure_ascii=False)

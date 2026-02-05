@@ -39,6 +39,10 @@ env/
 *.log
 *.sqlite3
 
+# Cache and data
+cache/
+data/
+
 # OS generated files
 Thumbs.db
 .DS_Store

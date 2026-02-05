@@ -26,13 +26,24 @@ if utils_dir not in sys.path:
 
 logger = logging.getLogger(__name__)
 
+# Диагностика Ozon категорий/атрибутов: включается переменной окружения OZON_CATEGORY_DEBUG=1
+OZON_CATEGORY_DEBUG = os.getenv("OZON_CATEGORY_DEBUG", "0").strip() in ("1", "true", "True", "yes", "Y")
+
 from handlers.ozon_remains_handler import OzonAPI
 from handlers.wb_remains_handler import WildberriesAPI
 from handlers.ozon_remains_handler import clean_offer_id
 from handlers.wb_remains_handler import clean_article
+from utils.stock_control import resolve_stock_thresholds, apply_fill_to_cells
+from utils.ozon_attributes import (
+    flatten_description_category_tree,
+    build_category_full_paths,
+    extract_attribute_values_from_product_attributes,
+)
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # секунды
+
+CACHE_DIR = os.path.join(root_dir, "cache")
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ: СЫРЫЕ ДАННЫЕ ===
 
@@ -40,8 +51,51 @@ async def fetch_ozon_remains_raw(cabinet_id):
     """Полностью копируем логику из handle_cabinet_choice для надежности"""
     ozon = OzonAPI(cabinet_id=cabinet_id)
 
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    ozon_cache_dir = os.path.join(CACHE_DIR, "ozon")
+    os.makedirs(ozon_cache_dir, exist_ok=True)
+
+    t0_total = time.time()
+
+    def _ozon_post(path: str, payload: dict, timeout: int = 60) -> dict | None:
+        """POST в Ozon Seller API через requests, т.к. не все методы обёрнуты в OzonAPI."""
+        import requests
+        try:
+            resp = requests.post(f"{ozon.base_url}{path}", json=payload, headers=ozon.headers, timeout=timeout)
+            if resp.status_code != 200:
+                logger.warning(f"Ozon кабинет {cabinet_id}: {path} -> {resp.status_code}: {resp.text}")
+                return None
+            return resp.json() or {}
+        except Exception as e:
+            logger.warning(f"Ozon кабинет {cabinet_id}: ошибка запроса {path}: {e}")
+            return None
+
+    def _cache_read_json(path: str) -> dict | None:
+        import json
+        try:
+            if not os.path.exists(path):
+                return None
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _cache_write_json(path: str, data: dict) -> None:
+        import json
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)  # type: ignore[arg-type]
+        except Exception:
+            return None
+
+    # Для диагностики: соберём несколько товаров, у которых категория получилась слишком общей
+    debug_category_samples: list[dict] = []
+    debug_category_samples_limit = 10
+
     # --- Получение данных (точно как в рабочей функции) ---
+    t0 = time.time()
     product_list = ozon.get_product_list(limit=1000)
+    logger.info(f"Ozon кабинет {cabinet_id}: get_product_list за {time.time() - t0:.2f}s")
     if not product_list:
         logger.warning(f"Ozon кабинет {cabinet_id}: не удалось получить список товаров")
         return {}, []
@@ -59,8 +113,33 @@ async def fetch_ozon_remains_raw(cabinet_id):
 
     all_skus = []
     offer_id_to_name = {}
+    offer_id_to_product_id = {}
+
+    # Категории лучше брать из attributes (/v4/product/info/attributes),
+    # т.к. /v3/product/info/list часто не возвращает человекочитаемую категорию.
+    offer_id_to_category = {}
+    offer_id_to_barcodes: dict[str, list[str]] = {}
+
+    offer_id_to_type_id: dict[str, int] = {}
+    offer_id_to_description_category_id: dict[str, int] = {}
+
+    def _extract_ozon_category_from_attributes(info_item: dict) -> str:
+        # Приоритет: явная строка категории -> id категории описания
+        for key in ("category", "category_name", "category_id"):
+            value = info_item.get(key)
+            if value is not None and str(value).strip() != "":
+                return str(value).strip()
+
+        dcid = info_item.get("description_category_id")
+        if dcid is not None and str(dcid).strip() != "":
+            return str(dcid).strip()
+
+        return "—"
 
     from handlers.ozon_remains_handler import chunk_list
+
+    # 1) Получаем sku/name + product_id для последующего запроса attributes
+    t0 = time.time()
     for chunk in chunk_list(offer_ids, 1000):
         product_info_response = ozon.get_product_info_list(offer_ids=chunk)
         if not product_info_response:
@@ -79,10 +158,258 @@ async def fetch_ozon_remains_raw(cabinet_id):
         for item_info in items_in_response:
             offer_id = clean_offer_id(item_info.get('offer_id'))
             sku = item_info.get('sku')
+            product_id = item_info.get('id') or item_info.get('product_id')
             name = item_info.get('name', '—')
+            if offer_id:
+                offer_id_to_name[offer_id] = name
+                if product_id is not None:
+                    offer_id_to_product_id[offer_id] = product_id
+
+                # Для материалов/категорий
+                dcid = item_info.get("description_category_id")
+                if dcid is not None:
+                    try:
+                        offer_id_to_description_category_id[offer_id] = int(dcid)
+                    except Exception:
+                        pass
+
+                tpid = item_info.get("type_id")
+                if tpid is not None:
+                    try:
+                        offer_id_to_type_id[offer_id] = int(tpid)
+                    except Exception:
+                        pass
+
             if offer_id and sku:
                 all_skus.append(sku)
-                offer_id_to_name[offer_id] = name
+
+    logger.info(f"Ozon кабинет {cabinet_id}: get_product_info_list (chunks={max(1, (len(offer_ids)+999)//1000)}) за {time.time() - t0:.2f}s")
+
+    # === Справочник description_category_id -> category_name ===
+    category_name_by_id: dict[int, str] = {}
+    category_full_path_by_id: dict[int, str] = {}
+    # type_name по type_id (внутри конкретной description_category_id)
+    category_type_name_by_pair: dict[tuple[int, int], str] = {}
+    try:
+        t0 = time.time()
+        tree_cache_path = os.path.join(ozon_cache_dir, "description_category_tree_DEFAULT.json")
+        tree = _cache_read_json(tree_cache_path)
+        if not tree:
+            tree = ozon.get_description_category_tree(language="DEFAULT")
+            if tree:
+                _cache_write_json(tree_cache_path, tree)
+        logger.info(f"Ozon кабинет {cabinet_id}: description-category/tree за {time.time() - t0:.2f}s (cache={'hit' if os.path.exists(tree_cache_path) else 'miss'})")
+        if tree and tree.get("result"):
+            category_name_by_id = flatten_description_category_tree(tree.get("result"))
+            category_full_path_by_id = build_category_full_paths(tree.get("result"))
+
+            # Соберём маппинг (description_category_id, type_id) -> type_name
+            def _walk(nodes, parent_dcid=None):
+                for n in nodes or []:
+                    dcid = n.get("description_category_id", parent_dcid)
+                    # В некоторых узлах type_id/type_name есть при отсутствии dcid
+                    tpid = n.get("type_id")
+                    tname = n.get("type_name")
+                    if dcid is not None and tpid is not None and tname:
+                        try:
+                            category_type_name_by_pair[(int(dcid), int(tpid))] = str(tname).strip()
+                        except Exception:
+                            pass
+
+                    children = n.get("children") or []
+                    _walk(children, dcid)
+
+            _walk(tree.get("result"), None)
+    except Exception as e:
+        logger.warning(f"Ozon кабинет {cabinet_id}: не удалось получить дерево категорий: {e}")
+
+    # 2) Запрашиваем product attributes (и через них заполним категорию/состав)
+    offer_id_to_category = dict(offer_id_to_category)  # keep existing
+    offer_id_to_composition: dict[str, str] = {}
+
+    # Кеш метаданных атрибутов по (dcid,type_id)
+    attributes_meta_cache: dict[tuple[int, int], list[dict]] = {}
+
+    def _resolve_composition_attribute_id(dcid: int, type_id: int) -> int | None:
+        """Ищем атрибут состава по МЕТАДАННЫМ атрибутов категории.
+
+        В отличие от "материал" — состав обычно приходит как строка (dictionary_id == 0)
+        и содержит проценты (например: "65% полиэстер, 35% хлопок").
+        """
+        key = (int(dcid), int(type_id))
+        if key in attributes_meta_cache:
+            attrs = attributes_meta_cache[key]
+        else:
+            cache_path = os.path.join(ozon_cache_dir, f"attrs_{key[0]}_{key[1]}_DEFAULT.json")
+            cached = _cache_read_json(cache_path)
+            if cached and isinstance(cached.get("result"), list):
+                attrs = cached.get("result")
+            else:
+                t_req = time.time()
+                resp = _ozon_post(
+                    "/v1/description-category/attribute",
+                    {
+                        "description_category_id": key[0],
+                        "type_id": key[1],
+                        "language": "DEFAULT",
+                    },
+                    timeout=60,
+                )
+                logger.info(
+                    f"Ozon кабинет {cabinet_id}: /v1/description-category/attribute dcid={key[0]} type_id={key[1]} за {time.time()-t_req:.2f}s"
+                )
+                attrs = (resp or {}).get("result") or []
+                if resp:
+                    _cache_write_json(cache_path, resp)
+            attributes_meta_cache[key] = attrs
+
+        # кандидаты только строковые и не collection
+        candidates = []
+        for a in attrs:
+            try:
+                if str(a.get("type") or "").lower() not in ("string", "text"):
+                    continue
+                if bool(a.get("is_collection")):
+                    continue
+            except Exception:
+                pass
+            candidates.append(a)
+
+        if not candidates:
+            return None
+
+        preferred_names = [
+            "Состав",
+            "Состав ткани",
+            "Состав материала",
+            "Состав изделия",
+            "Состав верха",
+        ]
+
+        def _score(a: dict) -> int:
+            name = str(a.get("name") or "").strip()
+            group = str(a.get("group_name") or "").strip()
+            s = 0
+            if name in preferred_names:
+                s += 100
+            if "состав" in name.lower():
+                s += 30
+            if group in ("Состав", "Состав и уход", "Материалы"):
+                s += 10
+            return s
+
+        best = sorted(candidates, key=_score, reverse=True)[0]
+        try:
+            return int(best.get("id"))
+        except Exception:
+            return None
+
+    # Убираем кеши material_* — они больше не нужны для "Состав".
+
+    # NOTE: для "Состав" мы используем строковый атрибут из /v4/product/info/attributes,
+    # поэтому справочник значений (/attribute/values) не нужен.
+
+    # (метод отсутствует в OzonAPI, поэтому вызываем напрямую)
+    product_ids = list({pid for pid in offer_id_to_product_id.values() if pid is not None})
+    if product_ids:
+        import requests
+        url = f"{ozon.base_url}/v4/product/info/attributes"
+        t0 = time.time()
+        # 1000 иногда долго/таймаутит, дробим меньше
+        batch_size = 250
+        total_chunks = max(1, (len(product_ids) + batch_size - 1) // batch_size)
+        for chunk in chunk_list(product_ids, batch_size):
+            payload = {
+                "filter": {
+                    "product_id": chunk,
+                    "visibility": "ALL"
+                },
+                "limit": len(chunk)
+            }
+            try:
+                resp = requests.post(url, json=payload, headers=ozon.headers, timeout=60)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json() or {}
+                for info_item in (data.get("result") or []):
+                    offer_id = clean_offer_id(info_item.get('offer_id'))
+                    if not offer_id:
+                        continue
+
+                    # Баркоды
+                    try:
+                        bcs = info_item.get("barcodes")
+                        if isinstance(bcs, list):
+                            offer_id_to_barcodes[offer_id] = [str(x).strip() for x in bcs if str(x).strip()]
+                        else:
+                            bc = info_item.get("barcode")
+                            if bc is not None and str(bc).strip():
+                                offer_id_to_barcodes[offer_id] = [str(bc).strip()]
+                    except Exception:
+                        pass
+
+                    # Категория: переводим description_category_id -> name, если возможно
+                    cat_name = None
+                    dcid = info_item.get("description_category_id")
+                    if dcid is not None:
+                        try:
+                            dcid_i = int(dcid)
+                            # Сначала пытаемся взять type_name — это самая узкая категория (например: 'Парео', 'Туники')
+                            tpid = info_item.get("type_id")
+                            if tpid is not None:
+                                try:
+                                    type_name = category_type_name_by_pair.get((dcid_i, int(tpid)))
+                                except Exception:
+                                    type_name = None
+                                if type_name:
+                                    cat_name = type_name
+
+                            # Если type_name не нашли, берём последний сегмент полного пути
+                            if not cat_name:
+                                full_path = category_full_path_by_id.get(dcid_i)
+                                if full_path:
+                                    cat_name = str(full_path).split(" / ")[-1].strip() or None
+
+                            # Если нет полного пути — берём просто имя категории
+                            if not cat_name:
+                                cat_name = category_name_by_id.get(dcid_i)
+
+                            offer_id_to_description_category_id[offer_id] = dcid_i
+                        except Exception:
+                            pass
+
+                    if not cat_name:
+                        cat_name = _extract_ozon_category_from_attributes(info_item)
+
+                    offer_id_to_category[offer_id] = cat_name or "—"
+
+                    # === Состав (composition) ===
+                    dcid_i = offer_id_to_description_category_id.get(offer_id)
+                    type_id_i = offer_id_to_type_id.get(offer_id)
+                    if dcid_i and type_id_i:
+                        comp_attr_id = _resolve_composition_attribute_id(dcid_i, type_id_i)
+                        if comp_attr_id:
+                            str_vals, dict_ids = extract_attribute_values_from_product_attributes(info_item, comp_attr_id)
+                            # Для состава ожидаем строковое значение, dict_ids игнорируем
+                            comp_texts = [str(v).strip() for v in (str_vals or []) if str(v).strip()]
+                            if comp_texts:
+                                # Берём первое непустое
+                                offer_id_to_composition[offer_id] = comp_texts[0]
+
+            except Exception as e:
+                logger.warning(f"Ozon кабинет {cabinet_id}: не удалось получить категории/состав через attributes: {e}")
+                continue
+        logger.info(f"Ozon кабинет {cabinet_id}: /v4/product/info/attributes chunks={total_chunks} за {time.time()-t0:.2f}s")
+
+    # Выведем диагностический лог после обработки attributes
+    if OZON_CATEGORY_DEBUG and debug_category_samples:
+        try:
+            logger.warning(
+                f"OZON_CATEGORY_DEBUG: кабинет {cabinet_id}: примеры товаров с общей категорией 'Одежда' "
+                f"(показываем {len(debug_category_samples)}): {debug_category_samples}"
+            )
+        except Exception:
+            pass
 
     if not all_skus:
         logger.warning(f"Ozon кабинет {cabinet_id}: не удалось получить SKU")
@@ -106,6 +433,7 @@ async def fetch_ozon_remains_raw(cabinet_id):
             if offer_id not in raw_stock_dict:
                 raw_stock_dict[offer_id] = {
                     'name': name,
+                    'category': offer_id_to_category.get(offer_id, '—'),
                     'available': 0,
                     'returning': 0,
                     'prepare': 0
@@ -146,6 +474,7 @@ async def fetch_ozon_remains_raw(cabinet_id):
                 if offer_id not in raw_stock_dict:
                     raw_stock_dict[offer_id] = {
                         'name': name,
+                        'category': offer_id_to_category.get(offer_id, '—'),
                         'available': 0,
                         'returning': 0,
                         'prepare': 0
@@ -160,7 +489,7 @@ async def fetch_ozon_remains_raw(cabinet_id):
     for offer_id, data in raw_stock_dict.items():
         total = data['available'] + data['returning'] + data['prepare']
         raw_data.append({
-            'Наименование': data['name'],
+            'Категория': data.get('category', '—'),
             'Артикул': offer_id,
             'Доступно на складах': data['available'],
             'Возвращаются от покупателей': data['returning'],
@@ -180,28 +509,50 @@ async def fetch_ozon_remains_raw(cabinet_id):
     return result_dict, raw_data
 
 
+def normalize_wb_size(value) -> str:
+    """Нормализация размера WB для отчётов.
+
+    Если размер отсутствует/0/ONE — возвращаем "единый".
+    """
+    if value is None:
+        return "единый"
+    s = str(value).strip()
+    if not s:
+        return "единый"
+    s_up = s.upper()
+    if s_up in {"0", "ONE", "ONE SIZE", "ONESIZE", "ЕДИНЫЙ", "ЕДИНЫЙ РАЗМЕР"}:
+        return "единый"
+    return s
+
+
 async def fetch_wb_remains_raw(cabinet_id):
-    raw_stock_dict = {}
-    raw_data = []
-    stock_dict = {}
+    raw_stock_dict: dict[str, dict] = {}
+    raw_data: list[dict] = []
 
     for attempt in range(MAX_RETRIES):
         try:
             wb = WildberriesAPI(cabinet_id=cabinet_id)
-            stocks = wb.get_fbo_stocks_v1()  # ← это синхронный вызов
 
-            # Агрегация данных (как у тебя было)
-            for item in stocks:
+            t0 = time.time()
+            stocks = wb.get_fbo_stocks_v1()  # синхронный вызов
+            logger.info(
+                f"WB кабинет {cabinet_id}: get_fbo_stocks_v1 строк={len(stocks or [])} за {time.time() - t0:.2f}s"
+            )
+
+            for item in (stocks or []):
                 art = clean_article(item.get("supplierArticle"))
                 if not art:
                     continue
 
-                quantity = item.get('quantity', 0)
-                in_way_to_client = item.get('inWayToClient', 0)
-                in_way_from_client = item.get('inWayFromClient', 0)
+                category = item.get("subject") or item.get("category") or "—"
+
+                quantity = item.get('quantity', 0) or 0
+                in_way_to_client = item.get('inWayToClient', 0) or 0
+                in_way_from_client = item.get('inWayFromClient', 0) or 0
 
                 if art not in raw_stock_dict:
                     raw_stock_dict[art] = {
+                        'category': str(category).strip() if str(category).strip() else "—",
                         'quantity': 0,
                         'in_way_to_client': 0,
                         'in_way_from_client': 0
@@ -211,40 +562,38 @@ async def fetch_wb_remains_raw(cabinet_id):
                 raw_stock_dict[art]['in_way_to_client'] += in_way_to_client
                 raw_stock_dict[art]['in_way_from_client'] += in_way_from_client
 
-            # Формируем raw_data и stock_dict
             for art, data in raw_stock_dict.items():
                 total = data['quantity'] + data['in_way_to_client'] + data['in_way_from_client']
                 raw_data.append({
+                    'Категория': data.get('category', '—'),
                     'Артикул': art,
                     'Доступно на складах': data['quantity'],
                     'Возвращаются от покупателей': data['in_way_from_client'],
                     'В пути до покупателей': data['in_way_to_client'],
                     'Итого на МП': total
                 })
-                stock_dict[art] = {
+
+            result_dict = {}
+            for art, data in raw_stock_dict.items():
+                result_dict[art] = {
                     'avail': data['quantity'],
                     'return': data['in_way_from_client'],
                     'inway': data['in_way_to_client']
                 }
 
             logger.info(f"✅ Успешно получены остатки WB кабинет {cabinet_id} (попытка {attempt + 1})")
-            return stock_dict, raw_data
+            return result_dict, raw_data
 
         except (Timeout, RequestException) as e:
             logger.warning(f"⚠️ Попытка {attempt + 1}/{MAX_RETRIES} не удалась для WB кабинет {cabinet_id}: {e}")
             if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
+                time.sleep(RETRY_DELAY)
             else:
-                logger.error(f"❌ Все попытки получения остатков WB кабинет {cabinet_id} провалились")
-                # Возвращаем пустые данные, но не падаем
+                logger.error(f"❌ Ошибка получения остатков WB кабинет {cabinet_id} после {MAX_RETRIES} попыток")
                 return {}, []
-
         except Exception as e:
-            logger.error(f"❌ Неизвестная ошибка при получении WB остатков кабинет {cabinet_id}: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка получения остатков WB кабинет {cabinet_id}: {e}", exc_info=True)
             return {}, []
-
-    return {}, []
-
 
 # === ФУНКЦИЯ НОРМАЛИЗАЦИИ ===
 
@@ -256,6 +605,14 @@ def normalize_art(art_str):
     s = ''.join(c for c in s if c.isprintable())
     s = s.strip().lower()
     return s
+
+
+def _get_rows_to_color(df, art_column, cabinet_arts_set):
+    rows = []
+    for idx, art in enumerate(df[art_column], start=3):
+        if normalize_art(art) in cabinet_arts_set:
+            rows.append(idx)
+    return rows
 
 
 # === ФУНКЦИИ ДЛЯ СОЗДАНИЯ EXCEL ЛИСТОВ ===
@@ -374,6 +731,20 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         wb2_id_to_name, wb2_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ Galioni")
         wb3_id_to_name, wb3_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ AGNIA")
 
+        ozon1_linked_ids = set(ozon1_id_to_arts.keys())
+        ozon2_linked_ids = set(ozon2_id_to_arts.keys())
+        ozon3_linked_ids = set(ozon3_id_to_arts.keys())
+        wb1_linked_ids = set(wb1_id_to_arts.keys())
+        wb2_linked_ids = set(wb2_id_to_arts.keys())
+        wb3_linked_ids = set(wb3_id_to_arts.keys())
+
+        ozon1_arts_set = {normalize_art(art) for arts in ozon1_id_to_arts.values() for art in arts}
+        ozon2_arts_set = {normalize_art(art) for arts in ozon2_id_to_arts.values() for art in arts}
+        ozon3_arts_set = {normalize_art(art) for arts in ozon3_id_to_arts.values() for art in arts}
+        wb1_arts_set = {normalize_art(art) for arts in wb1_id_to_arts.values() for art in arts}
+        wb2_arts_set = {normalize_art(art) for arts in wb2_id_to_arts.values() for art in arts}
+        wb3_arts_set = {normalize_art(art) for arts in wb3_id_to_arts.values() for art in arts}
+
         # === 3. Построим обратные маппинги ===
         def build_reverse(id_to_arts):
             rev = {}
@@ -471,6 +842,8 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         wb = load_workbook(report_copy)
         ws = wb.active  # Это уже готовый лист "Остатки на МП" с правильным оформлением
 
+        thresholds = resolve_stock_thresholds(context, update.effective_chat.id)
+
         # Заполняем данными (только значения, оформление остаётся как в шаблоне)
         row = 7
         while True:
@@ -506,6 +879,8 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
                 ws[f"C{row}"] = o1['return']
                 ws[f"D{row}"] = o1['prep']
                 ws[f"E{row}"] = o1['avail'] + o1['return'] + o1['prep']
+                if thresholds and template_id in ozon1_linked_ids:
+                    apply_fill_to_cells(ws, [row], [5], thresholds)
 
                 # --- Ozon 2 ---
                 o2 = ozon2_agg.get(template_id, {'avail': 0, 'return': 0, 'prep': 0})
@@ -513,6 +888,8 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
                 ws[f"H{row}"] = o2['return']
                 ws[f"I{row}"] = o2['prep']
                 ws[f"J{row}"] = o2['avail'] + o2['return'] + o2['prep']
+                if thresholds and template_id in ozon2_linked_ids:
+                    apply_fill_to_cells(ws, [row], [10], thresholds)
 
                 # --- Ozon 3 ---
                 o3 = ozon3_agg.get(template_id, {'avail': 0, 'return': 0, 'prep': 0})
@@ -520,6 +897,8 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
                 ws[f"M{row}"] = o3['return']
                 ws[f"N{row}"] = o3['prep']
                 ws[f"O{row}"] = o3['avail'] + o3['return'] + o3['prep']
+                if thresholds and template_id in ozon3_linked_ids:
+                    apply_fill_to_cells(ws, [row], [15], thresholds)
 
                 # --- WB 1 ---
                 w1 = wb1_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
@@ -527,6 +906,8 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
                 ws[f"R{row}"] = w1['return']
                 ws[f"S{row}"] = w1['inway']
                 ws[f"T{row}"] = w1['avail'] + w1['return'] + w1['inway']
+                if thresholds and template_id in wb1_linked_ids:
+                    apply_fill_to_cells(ws, [row], [20], thresholds)
 
                 # --- WB 2 ---
                 w2 = wb2_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
@@ -534,6 +915,8 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
                 ws[f"W{row}"] = w2['return']
                 ws[f"X{row}"] = w2['inway']
                 ws[f"Y{row}"] = w2['avail'] + w2['return'] + w2['inway']
+                if thresholds and template_id in wb2_linked_ids:
+                    apply_fill_to_cells(ws, [row], [25], thresholds)
 
                 # --- WB 3 ---
                 w3 = wb3_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
@@ -541,43 +924,57 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
                 ws[f"AB{row}"] = w3['return']
                 ws[f"AC{row}"] = w3['inway']
                 ws[f"AD{row}"] = w3['avail'] + w3['return'] + w3['inway']
+                if thresholds and template_id in wb3_linked_ids:
+                    apply_fill_to_cells(ws, [row], [30], thresholds)
 
             row += 1
 
-        # === ДОБАВЛЯЕМ ДОПОЛНИТЕЛЬНЫЕ ЛИСТЫ ===
+        # === ДОПОЛНИТЕЛЬНЫЕ ЛИСТЫ ===
 
         # Ozon1 исходные артикулы
         if ozon1_raw_data:
-            df_ozon1_raw = pd.DataFrame(ozon1_raw_data).sort_values(by='Наименование',
+            df_ozon1_raw = pd.DataFrame(ozon1_raw_data).sort_values(by='Категория',
                                                                     key=lambda x: x.str.lower()).reset_index(drop=True)
-            headers_ozon1 = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
-                             "Подготовка к продаже", "Итого на МП"]
+            headers_ozon1 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                              "Подготовка к продаже", "Итого на МП"]
             ws_ozon1 = wb.create_sheet(title="Ozon1 исходные артикулы")
             _write_sheet(ws_ozon1, df_ozon1_raw, headers_ozon1, has_name=True)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_ozon1_raw, "Артикул", ozon1_arts_set)
+                total_col = headers_ozon1.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_ozon1, rows_to_color, [total_col], thresholds)
         else:
             ws_ozon1 = wb.create_sheet(title="Ozon1 исходные артикулы")
             ws_ozon1.append(["Нет данных"])
 
         # Ozon2 исходные артикулы
         if ozon2_raw_data:
-            df_ozon2_raw = pd.DataFrame(ozon2_raw_data).sort_values(by='Наименование',
+            df_ozon2_raw = pd.DataFrame(ozon2_raw_data).sort_values(by='Категория',
                                                                     key=lambda x: x.str.lower()).reset_index(drop=True)
-            headers_ozon2 = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
-                             "Подготовка к продаже", "Итого на МП"]
+            headers_ozon2 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                              "Подготовка к продаже", "Итого на МП"]
             ws_ozon2 = wb.create_sheet(title="Ozon2 исходные артикулы")
             _write_sheet(ws_ozon2, df_ozon2_raw, headers_ozon2, has_name=True)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_ozon2_raw, "Артикул", ozon2_arts_set)
+                total_col = headers_ozon2.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_ozon2, rows_to_color, [total_col], thresholds)
         else:
             ws_ozon2 = wb.create_sheet(title="Ozon2 исходные артикулы")
             ws_ozon2.append(["Нет данных"])
 
         # Ozon3 исходные артикулы
         if ozon3_raw_data:
-            df_ozon3_raw = pd.DataFrame(ozon3_raw_data).sort_values(by='Наименование',
+            df_ozon3_raw = pd.DataFrame(ozon3_raw_data).sort_values(by='Категория',
                                                                     key=lambda x: x.str.lower()).reset_index(drop=True)
-            headers_ozon3 = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
-                             "Подготовка к продаже", "Итого на МП"]
+            headers_ozon3 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                              "Подготовка к продаже", "Итого на МП"]
             ws_ozon3 = wb.create_sheet(title="Ozon AGNIA исходные артикулы")
             _write_sheet(ws_ozon3, df_ozon3_raw, headers_ozon3, has_name=True)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_ozon3_raw, "Артикул", ozon3_arts_set)
+                total_col = headers_ozon3.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_ozon3, rows_to_color, [total_col], thresholds)
         else:
             ws_ozon3 = wb.create_sheet(title="Ozon AGNIA исходные артикулы")
             ws_ozon3.append(["Нет данных"])
@@ -585,10 +982,14 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         # WB1 исходные артикулы
         if wb1_raw_data:
             df_wb1_raw = pd.DataFrame(wb1_raw_data).sort_values(by='Артикул').reset_index(drop=True)
-            headers_wb1 = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
-                           "Итого на МП"]
+            headers_wb1 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
+                            "Итого на МП"]
             ws_wb1 = wb.create_sheet(title="WB1 исходные артикулы")
             _write_sheet(ws_wb1, df_wb1_raw, headers_wb1, has_name=False)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_wb1_raw, "Артикул", wb1_arts_set)
+                total_col = headers_wb1.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_wb1, rows_to_color, [total_col], thresholds)
         else:
             ws_wb1 = wb.create_sheet(title="WB1 исходные артикулы")
             ws_wb1.append(["Нет данных"])
@@ -596,10 +997,14 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         # WB2 исходные артикулы
         if wb2_raw_data:
             df_wb2_raw = pd.DataFrame(wb2_raw_data).sort_values(by='Артикул').reset_index(drop=True)
-            headers_wb2 = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
-                           "Итого на МП"]
+            headers_wb2 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
+                            "Итого на МП"]
             ws_wb2 = wb.create_sheet(title="WB2 исходные артикулы")
             _write_sheet(ws_wb2, df_wb2_raw, headers_wb2, has_name=False)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_wb2_raw, "Артикул", wb2_arts_set)
+                total_col = headers_wb2.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_wb2, rows_to_color, [total_col], thresholds)
         else:
             ws_wb2 = wb.create_sheet(title="WB2 исходные артикулы")
             ws_wb2.append(["Нет данных"])
@@ -607,10 +1012,14 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         # WB3 исходные артикулы
         if wb3_raw_data:
             df_wb3_raw = pd.DataFrame(wb3_raw_data).sort_values(by='Артикул').reset_index(drop=True)
-            headers_wb3 = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
-                           "Итого на МП"]
+            headers_wb3 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
+                            "Итого на МП"]
             ws_wb3 = wb.create_sheet(title="WB AGNIA исходные артикулы")
             _write_sheet(ws_wb3, df_wb3_raw, headers_wb3, has_name=False)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_wb3_raw, "Артикул", wb3_arts_set)
+                total_col = headers_wb3.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_wb3, rows_to_color, [total_col], thresholds)
         else:
             ws_wb3 = wb.create_sheet(title="WB AGNIA исходные артикулы")
             ws_wb3.append(["Нет данных"])
@@ -689,19 +1098,19 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
             "🏪 <b>Wildberries Кабинет 1 (Nimba)</b>\n"
             f"   📦 Доступно на складах: {fmt(wb1_total_avail)} шт\n"
             f"   ↩️ Возвращаются от покупателей: {fmt(wb1_total_return)} шт\n"
-            f"   🚚 В пути до покупателей: {fmt(wb1_total_inway)} шт\n"
+            f"   🚚 В пути до покупателей: {fmt(wb1_total_mp - wb1_total_avail - wb1_total_return)} шт\n"
             f"   ✅ Итого на МП: {fmt(wb1_total_mp)} шт\n\n"
 
             "🏬 <b>Wildberries Кабинет 2 (Galioni)</b>\n"
             f"   📦 Доступно на складах: {fmt(wb2_total_avail)} шт\n"
             f"   ↩️ Возвращаются от покупателей: {fmt(wb2_total_return)} шт\n"
-            f"   🚚 В пути до покупателей: {fmt(wb2_total_inway)} шт\n"
+            f"   🚚 В пути до покупателей: {fmt(wb2_total_mp - wb2_total_avail - wb2_total_return)} шт\n"
             f"   ✅ Итого на МП: {fmt(wb2_total_mp)} шт\n\n"
 
             "🏢 <b>Wildberries Кабинет 3 (AGNIA)</b>\n"
             f"   📦 Доступно на складах: {fmt(wb3_total_avail)} шт\n"
             f"   ↩️ Возвращаются от покупателей: {fmt(wb3_total_return)} шт\n"
-            f"   🚚 В пути до покупателей: {fmt(wb3_total_inway)} шт\n"
+            f"   🚚 В пути до покупателей: {fmt(wb3_total_mp - wb3_total_avail - wb3_total_return)} шт\n"
             f"   ✅ Итого на МП: {fmt(wb3_total_mp)} шт\n\n"
 
             f"🔹 <b>ВСЕГО на всех маркетплейсах:</b> {fmt(total_all_mp)} шт"
@@ -806,6 +1215,21 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
         wb2_id_to_name, wb2_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ Galioni")
         wb3_id_to_name, wb3_id_to_arts = get_cabinet_articles_by_template_id("Отдельно ВБ AGNIA")
 
+        ozon1_linked_ids = set(ozon1_id_to_arts.keys())
+        ozon2_linked_ids = set(ozon2_id_to_arts.keys())
+        ozon3_linked_ids = set(ozon3_id_to_arts.keys())
+        wb1_linked_ids = set(wb1_id_to_arts.keys())
+        wb2_linked_ids = set(wb2_id_to_arts.keys())
+        wb3_linked_ids = set(wb3_id_to_arts.keys())
+
+        ozon1_arts_set = {normalize_art(art) for arts in ozon1_id_to_arts.values() for art in arts}
+        ozon2_arts_set = {normalize_art(art) for arts in ozon2_id_to_arts.values() for art in arts}
+        ozon3_arts_set = {normalize_art(art) for arts in ozon3_id_to_arts.values() for art in arts}
+        wb1_arts_set = {normalize_art(art) for arts in wb1_id_to_arts.values() for art in arts}
+        wb2_arts_set = {normalize_art(art) for arts in wb2_id_to_arts.values() for art in arts}
+        wb3_arts_set = {normalize_art(art) for arts in wb3_id_to_arts.values() for art in arts}
+
+        # === 3. Построим обратные маппинги ===
         def build_reverse(id_to_arts):
             rev = {}
             for tid, arts in id_to_arts.items():
@@ -821,6 +1245,7 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
         wb2_rev = build_reverse(wb2_id_to_arts)
         wb3_rev = build_reverse(wb3_id_to_arts)
 
+        # === 4. Агрегация данных ===
         ozon1_agg = {}
         for art, data in ozon1_raw_dict.items():
             clean_art = normalize_art(art)
@@ -887,16 +1312,23 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
                 wb3_agg[tid]['return'] += data['return']
                 wb3_agg[tid]['inway'] += data['inway']
 
+        # === 5. РАБОТА С ШАБЛОНОМ - ПОЛНОЕ КОПИРОВАНИЕ ===
         template_report_path = os.path.join(root_dir, "Шаблон выгрузки остатков всех МП.xlsx")
         if not os.path.exists(template_report_path):
             raise FileNotFoundError("Файл 'Шаблон выгрузки остатков всех МП.xlsx' не найден!")
 
-        report_copy = os.path.join(root_dir, f"Остатки_все_МП_авто_{int(time.time())}.xlsx")
+        report_copy = os.path.join(root_dir, "Остатки_все_МП_отчёт.xlsx")
+
+        # ПОЛНОСТЬЮ КОПИРУЕМ ФАЙЛ ШАБЛОНА
         shutil.copy(template_report_path, report_copy)
 
+        # Загружаем скопированный файл
         wb = load_workbook(report_copy)
-        ws = wb.active
+        ws = wb.active  # Это уже готовый лист "Остатки на МП" с правильным оформлением
 
+        thresholds = resolve_stock_thresholds(context, chat_id)
+
+        # Заполняем данными (только значения, оформление остаётся как в шаблоне)
         row = 7
         while True:
             cell_value = ws[f"A{row}"].value
@@ -904,6 +1336,8 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
                 break
 
             art_name = str(cell_value).strip()
+
+            # Ищем template_id по имени во ВСЕХ кабинетах
             template_id = None
             all_id_to_name = [
                 ozon1_id_to_name,
@@ -923,104 +1357,153 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
                     break
 
             if template_id is not None:
+                # --- Ozon 1 ---
                 o1 = ozon1_agg.get(template_id, {'avail': 0, 'return': 0, 'prep': 0})
                 ws[f"B{row}"] = o1['avail']
                 ws[f"C{row}"] = o1['return']
                 ws[f"D{row}"] = o1['prep']
                 ws[f"E{row}"] = o1['avail'] + o1['return'] + o1['prep']
+                if thresholds and template_id in ozon1_linked_ids:
+                    apply_fill_to_cells(ws, [row], [5], thresholds)
 
+                # --- Ozon 2 ---
                 o2 = ozon2_agg.get(template_id, {'avail': 0, 'return': 0, 'prep': 0})
                 ws[f"G{row}"] = o2['avail']
                 ws[f"H{row}"] = o2['return']
                 ws[f"I{row}"] = o2['prep']
                 ws[f"J{row}"] = o2['avail'] + o2['return'] + o2['prep']
+                if thresholds and template_id in ozon2_linked_ids:
+                    apply_fill_to_cells(ws, [row], [10], thresholds)
 
+                # --- Ozon 3 ---
                 o3 = ozon3_agg.get(template_id, {'avail': 0, 'return': 0, 'prep': 0})
                 ws[f"L{row}"] = o3['avail']
                 ws[f"M{row}"] = o3['return']
                 ws[f"N{row}"] = o3['prep']
                 ws[f"O{row}"] = o3['avail'] + o3['return'] + o3['prep']
+                if thresholds and template_id in ozon3_linked_ids:
+                    apply_fill_to_cells(ws, [row], [15], thresholds)
 
+                # --- WB 1 ---
                 w1 = wb1_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
                 ws[f"Q{row}"] = w1['avail']
                 ws[f"R{row}"] = w1['return']
                 ws[f"S{row}"] = w1['inway']
                 ws[f"T{row}"] = w1['avail'] + w1['return'] + w1['inway']
+                if thresholds and template_id in wb1_linked_ids:
+                    apply_fill_to_cells(ws, [row], [20], thresholds)
 
+                # --- WB 2 ---
                 w2 = wb2_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
                 ws[f"V{row}"] = w2['avail']
                 ws[f"W{row}"] = w2['return']
                 ws[f"X{row}"] = w2['inway']
                 ws[f"Y{row}"] = w2['avail'] + w2['return'] + w2['inway']
+                if thresholds and template_id in wb2_linked_ids:
+                    apply_fill_to_cells(ws, [row], [25], thresholds)
 
+                # --- WB 3 ---
                 w3 = wb3_agg.get(template_id, {'avail': 0, 'return': 0, 'inway': 0})
                 ws[f"AA{row}"] = w3['avail']
                 ws[f"AB{row}"] = w3['return']
                 ws[f"AC{row}"] = w3['inway']
                 ws[f"AD{row}"] = w3['avail'] + w3['return'] + w3['inway']
+                if thresholds and template_id in wb3_linked_ids:
+                    apply_fill_to_cells(ws, [row], [30], thresholds)
 
             row += 1
 
         # === ДОПОЛНИТЕЛЬНЫЕ ЛИСТЫ ===
+
+        # Ozon1 исходные артикулы
         if ozon1_raw_data:
-            df_ozon1_raw = pd.DataFrame(ozon1_raw_data).sort_values(by='Наименование',
+            df_ozon1_raw = pd.DataFrame(ozon1_raw_data).sort_values(by='Категория',
                                                                     key=lambda x: x.str.lower()).reset_index(drop=True)
+            headers_ozon1 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                              "Подготовка к продаже", "Итого на МП"]
             ws_ozon1 = wb.create_sheet(title="Ozon1 исходные артикулы")
-            _write_sheet(ws_ozon1, df_ozon1_raw,
-                         ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
-                          "Подготовка к продаже", "Итого на МП"], has_name=True)
+            _write_sheet(ws_ozon1, df_ozon1_raw, headers_ozon1, has_name=True)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_ozon1_raw, "Артикул", ozon1_arts_set)
+                total_col = headers_ozon1.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_ozon1, rows_to_color, [total_col], thresholds)
         else:
             ws_ozon1 = wb.create_sheet(title="Ozon1 исходные артикулы")
             ws_ozon1.append(["Нет данных"])
 
+        # Ozon2 исходные артикулы
         if ozon2_raw_data:
-            df_ozon2_raw = pd.DataFrame(ozon2_raw_data).sort_values(by='Наименование',
+            df_ozon2_raw = pd.DataFrame(ozon2_raw_data).sort_values(by='Категория',
                                                                     key=lambda x: x.str.lower()).reset_index(drop=True)
+            headers_ozon2 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                              "Подготовка к продаже", "Итого на МП"]
             ws_ozon2 = wb.create_sheet(title="Ozon2 исходные артикулы")
-            _write_sheet(ws_ozon2, df_ozon2_raw,
-                         ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
-                          "Подготовка к продаже", "Итого на МП"], has_name=True)
+            _write_sheet(ws_ozon2, df_ozon2_raw, headers_ozon2, has_name=True)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_ozon2_raw, "Артикул", ozon2_arts_set)
+                total_col = headers_ozon2.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_ozon2, rows_to_color, [total_col], thresholds)
         else:
             ws_ozon2 = wb.create_sheet(title="Ozon2 исходные артикулы")
             ws_ozon2.append(["Нет данных"])
 
+        # Ozon3 исходные артикулы
         if ozon3_raw_data:
-            df_ozon3_raw = pd.DataFrame(ozon3_raw_data).sort_values(by='Наименование',
+            df_ozon3_raw = pd.DataFrame(ozon3_raw_data).sort_values(by='Категория',
                                                                     key=lambda x: x.str.lower()).reset_index(drop=True)
+            headers_ozon3 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+                              "Подготовка к продаже", "Итого на МП"]
             ws_ozon3 = wb.create_sheet(title="Ozon AGNIA исходные артикулы")
-            _write_sheet(ws_ozon3, df_ozon3_raw,
-                         ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
-                          "Подготовка к продаже", "Итого на МП"], has_name=True)
+            _write_sheet(ws_ozon3, df_ozon3_raw, headers_ozon3, has_name=True)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_ozon3_raw, "Артикул", ozon3_arts_set)
+                total_col = headers_ozon3.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_ozon3, rows_to_color, [total_col], thresholds)
         else:
             ws_ozon3 = wb.create_sheet(title="Ozon AGNIA исходные артикулы")
             ws_ozon3.append(["Нет данных"])
 
+        # WB1 исходные артикулы
         if wb1_raw_data:
             df_wb1_raw = pd.DataFrame(wb1_raw_data).sort_values(by='Артикул').reset_index(drop=True)
+            headers_wb1 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
+                            "Итого на МП"]
             ws_wb1 = wb.create_sheet(title="WB1 исходные артикулы")
-            _write_sheet(ws_wb1, df_wb1_raw,
-                         ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
-                          "Итого на МП"], has_name=False)
+            _write_sheet(ws_wb1, df_wb1_raw, headers_wb1, has_name=False)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_wb1_raw, "Артикул", wb1_arts_set)
+                total_col = headers_wb1.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_wb1, rows_to_color, [total_col], thresholds)
         else:
             ws_wb1 = wb.create_sheet(title="WB1 исходные артикулы")
             ws_wb1.append(["Нет данных"])
 
+        # WB2 исходные артикулы
         if wb2_raw_data:
             df_wb2_raw = pd.DataFrame(wb2_raw_data).sort_values(by='Артикул').reset_index(drop=True)
+            headers_wb2 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
+                            "Итого на МП"]
             ws_wb2 = wb.create_sheet(title="WB2 исходные артикулы")
-            _write_sheet(ws_wb2, df_wb2_raw,
-                         ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
-                          "Итого на МП"], has_name=False)
+            _write_sheet(ws_wb2, df_wb2_raw, headers_wb2, has_name=False)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_wb2_raw, "Артикул", wb2_arts_set)
+                total_col = headers_wb2.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_wb2, rows_to_color, [total_col], thresholds)
         else:
             ws_wb2 = wb.create_sheet(title="WB2 исходные артикулы")
             ws_wb2.append(["Нет данных"])
 
+        # WB3 исходные артикулы
         if wb3_raw_data:
             df_wb3_raw = pd.DataFrame(wb3_raw_data).sort_values(by='Артикул').reset_index(drop=True)
+            headers_wb3 = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
+                            "Итого на МП"]
             ws_wb3 = wb.create_sheet(title="WB AGNIA исходные артикулы")
-            _write_sheet(ws_wb3, df_wb3_raw,
-                         ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей",
-                          "Итого на МП"], has_name=False)
+            _write_sheet(ws_wb3, df_wb3_raw, headers_wb3, has_name=False)
+            if thresholds:
+                rows_to_color = _get_rows_to_color(df_wb3_raw, "Артикул", wb3_arts_set)
+                total_col = headers_wb3.index("Итого на МП") + 1
+                apply_fill_to_cells(ws_wb3, rows_to_color, [total_col], thresholds)
         else:
             ws_wb3 = wb.create_sheet(title="WB AGNIA исходные артикулы")
             ws_wb3.append(["Нет данных"])
@@ -1092,19 +1575,19 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
             f"🏪 <b>Wildberries Кабинет 1 (Nimba)</b>\n"
             f"   📦 Доступно на складах: {fmt(wb1_total_avail)} шт\n"
             f"   ↩️ Возвращаются от покупателей: {fmt(wb1_total_return)} шт\n"
-            f"   🚚 В пути до покупателей: {fmt(wb1_total_inway)} шт\n"
+            f"   🚚 В пути до покупателей: {fmt(wb1_total_mp - wb1_total_avail - wb1_total_return)} шт\n"
             f"   ✅ Итого на МП: {fmt(wb1_total_mp)} шт\n\n"
 
             f"🏬 <b>Wildberries Кабинет 2 (Galioni)</b>\n"
             f"   📦 Доступно на складах: {fmt(wb2_total_avail)} шт\n"
             f"   ↩️ Возвращаются от покупателей: {fmt(wb2_total_return)} шт\n"
-            f"   🚚 В пути до покупателей: {fmt(wb2_total_inway)} шт\n"
+            f"   🚚 В пути до покупателей: {fmt(wb2_total_mp - wb2_total_avail - wb2_total_return)} шт\n"
             f"   ✅ Итого на МП: {fmt(wb2_total_mp)} шт\n\n"
 
             f"🏢 <b>Wildberries Кабинет 3 (AGNIA)</b>\n"
             f"   📦 Доступно на складах: {fmt(wb3_total_avail)} шт\n"
             f"   ↩️ Возвращаются от покупателей: {fmt(wb3_total_return)} шт\n"
-            f"   🚚 В пути до покупателей: {fmt(wb3_total_inway)} шт\n"
+            f"   🚚 В пути до покупателей: {fmt(wb3_total_mp - wb3_total_avail - wb3_total_return)} шт\n"
             f"   ✅ Итого на МП: {fmt(wb3_total_mp)} шт\n\n"
 
             f"🔹 <b>ВСЕГО на всех маркетплейсах:</b> {fmt(total_all_mp)} шт"
@@ -1127,3 +1610,4 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
             chat_id=chat_id,
             text=f"❌ Ошибка при генерации {frequency_label.lower()} отчёта по всем маркетплейсам: {str(e)}"
         )
+

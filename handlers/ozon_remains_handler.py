@@ -10,6 +10,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.utils import get_column_letter
+from utils.template_loader import get_cabinet_articles_by_template_id
+from utils.stock_control import resolve_stock_thresholds, apply_fill_to_cells
+from utils.ozon_attributes import extract_attribute_values_from_product_attributes
 
 # Настройка путей
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -25,8 +28,6 @@ logger = logging.getLogger(__name__)
 
 from states import OZON_REMAINS_CABINET_CHOICE
 
-# Импорт новой функции из template_loader
-from utils.template_loader import get_cabinet_articles_by_template_id
 
 
 # ======================
@@ -114,6 +115,95 @@ class OzonAPI:
             logger.error(f"Ошибка при получении аналитики остатков: {e}")
             return []
 
+    def get_description_category_tree(self, language: str = "DEFAULT"):
+        """/v1/description-category/tree"""
+        url = f"{self.base_url}/v1/description-category/tree"
+        payload = {"language": language}
+        try:
+            response = requests.post(url, json=payload, headers=self.headers)
+            return response.json() if response.status_code == 200 else None
+        except Exception as e:
+            logger.error(f"Ошибка при получении дерева категорий: {e}")
+            return None
+
+    def get_description_category_attributes(self, description_category_id: int, type_id: int, language: str = "DEFAULT"):
+        """/v1/description-category/attribute"""
+        url = f"{self.base_url}/v1/description-category/attribute"
+        payload = {
+            "description_category_id": int(description_category_id),
+            "type_id": int(type_id),
+            "language": language,
+        }
+        try:
+            response = requests.post(url, json=payload, headers=self.headers)
+            return response.json() if response.status_code == 200 else None
+        except Exception as e:
+            logger.error(f"Ошибка при получении характеристик категории: {e}")
+            return None
+
+    def get_product_info_attributes(self, product_ids: list[int]):
+        """/v4/product/info/attributes"""
+        url = f"{self.base_url}/v4/product/info/attributes"
+        payload = {
+            "filter": {
+                "product_id": [int(x) for x in (product_ids or [])],
+                "visibility": "ALL",
+            },
+            "limit": len(product_ids or []),
+        }
+        try:
+            response = requests.post(url, json=payload, headers=self.headers)
+            return response.json() if response.status_code == 200 else None
+        except Exception as e:
+            logger.error(f"Ошибка при получении attributes товаров: {e}")
+            return None
+
+def _build_type_name_map_from_tree(tree_result: list) -> dict[tuple[int, int], str]:
+    """Строит маппинг (description_category_id, type_id) -> type_name.
+
+    В дереве Ozon встречаются узлы без description_category_id (тогда берём родительский).
+    """
+
+    result: dict[tuple[int, int], str] = {}
+
+    def _walk(nodes, current_dcid=None):
+        for node in nodes or []:
+            dcid = node.get("description_category_id", current_dcid)
+            tpid = node.get("type_id")
+            tname = node.get("type_name")
+            if dcid is not None and tpid is not None and tname:
+                try:
+                    result[(int(dcid), int(tpid))] = str(tname).strip()
+                except Exception:
+                    pass
+
+            _walk(node.get("children") or [], dcid)
+
+    _walk(tree_result, None)
+    return result
+
+
+def _resolve_ozon_narrow_category(
+    item_info: dict,
+    type_name_map: dict[tuple[int, int], str],
+) -> str:
+    """Возвращает максимально узкую категорию для товара.
+
+    Приоритет: type_name по (description_category_id,type_id). Иначе фолбэк на старую логику.
+    """
+
+    dcid = item_info.get("description_category_id")
+    tpid = item_info.get("type_id")
+    if dcid is not None and tpid is not None:
+        try:
+            name = type_name_map.get((int(dcid), int(tpid)))
+            if name:
+                return name
+        except Exception:
+            pass
+
+    return _extract_ozon_category(item_info)
+
 
 def clean_offer_id(offer_id_raw):
     """Только очищает от невидимых символов, НЕ меняет регистр"""
@@ -197,6 +287,14 @@ def group_ozon_remains_data(stock_data, template_id_to_cabinet_arts, template_id
     return grouped, unmatched
 
 
+def _extract_ozon_category(item_info):
+    for key in ("category", "category_name", "category_id"):
+        value = item_info.get(key)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+    return "—"
+
+
 # ======================
 # Обработчики
 # ======================
@@ -225,6 +323,10 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
     query = update.callback_query
     await query.answer()
 
+    # Явный alias на локально объявленную функцию генерации чанков,
+    # чтобы PyCharm корректно резолвил символ внутри этой функции.
+    chunk_list_fn = chunk_list
+
     cabinet_data = query.data
     cabinet_map = {
         'cabinet_1': 1,
@@ -244,6 +346,15 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
     try:
         ozon = OzonAPI(cabinet_id=cabinet_id)
 
+        # Узкая категория: подтягиваем дерево категорий 1 раз и строим словарь (dcid,type_id)->type_name
+        type_name_map: dict[tuple[int, int], str] = {}
+        try:
+            tree = ozon.get_description_category_tree(language="DEFAULT")
+            if tree and tree.get("result"):
+                type_name_map = _build_type_name_map_from_tree(tree.get("result"))
+        except Exception as e:
+            logger.warning(f"Не удалось построить словарь type_name по дереву категорий Ozon: {e}")
+
         # --- Получение данных ---
         product_list = ozon.get_product_list(limit=1000)
         if not product_list:
@@ -261,8 +372,9 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
 
         all_skus = []
         offer_id_to_name = {}
+        offer_id_to_category = {}
 
-        for chunk in chunk_list(offer_ids, 1000):
+        for chunk in chunk_list_fn(offer_ids, 1000):
             product_info_response = ozon.get_product_info_list(offer_ids=chunk)
             if not product_info_response:
                 continue
@@ -281,9 +393,12 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                 offer_id = clean_offer_id(item_info.get('offer_id'))
                 sku = item_info.get('sku')
                 name = item_info.get('name', '—')
+                # Вместо общей категории берём узкую (type_name) из дерева категорий
+                category = _resolve_ozon_narrow_category(item_info, type_name_map)
                 if offer_id and sku:
                     all_skus.append(sku)
                     offer_id_to_name[offer_id] = name
+                    offer_id_to_category[offer_id] = category
 
             time.sleep(0.5)
 
@@ -292,7 +407,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
 
         stock_dict = {}
 
-        for sku_chunk in chunk_list(all_skus, 100):
+        for sku_chunk in chunk_list_fn(all_skus, 100):
             items = ozon.get_analytics_stocks(sku_chunk)
             for item in items:
                 offer_id = clean_offer_id(item.get('offer_id'))
@@ -307,6 +422,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                 else:
                     stock_dict[offer_id] = {
                         'name': item.get('name', offer_id_to_name.get(offer_id, '—')),
+                        'category': offer_id_to_category.get(offer_id, '—'),
                         'available_stock_count': item.get('available_stock_count', 0),
                         'return_from_customer_stock_count': item.get('return_from_customer_stock_count', 0),
                         'valid_stock_count': item.get('valid_stock_count', 0)
@@ -315,7 +431,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
 
         missing_offer_ids = list(set(offer_ids) - set(stock_dict.keys()))
         if missing_offer_ids:
-            for chunk in chunk_list(missing_offer_ids, 100):
+            for chunk in chunk_list_fn(missing_offer_ids, 100):
                 info_response = ozon.get_product_info_list(offer_ids=chunk)
                 if not info_response:
                     continue
@@ -337,8 +453,11 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
 
                     stocks = item.get('stocks', {})
                     name = item.get('name', '—')
+                    # Узкая категория для отсутствующих остатков
+                    category = _resolve_ozon_narrow_category(item, type_name_map)
                     stock_dict[offer_id] = {
                         'name': name,
+                        'category': category,
                         'available_stock_count': stocks.get('present', 0),
                         'return_from_customer_stock_count': 0,
                         'valid_stock_count': stocks.get('reserved', 0)
@@ -347,15 +466,152 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                 time.sleep(0.5)
 
         # === 1. Отчёт по исходным артикулам ===
+        # --- Цвет и размер через /v4/product/info/attributes ---
+        offer_id_to_color: dict[str, str] = {}
+        offer_id_to_size: dict[str, str] = {}
+
+        # Собираем product_id и мету (dcid/type_id) для offer_id
+        offer_id_to_product_id: dict[str, int] = {}
+        offer_id_to_dcid: dict[str, int] = {}
+        offer_id_to_type_id: dict[str, int] = {}
+
+        # Для этого ещё раз получим info/list (у нас offer_ids уже есть выше по коду)
+        for chunk in chunk_list_fn(offer_ids, 1000):
+            info = ozon.get_product_info_list(offer_ids=chunk)
+            if not info:
+                continue
+            items_in_response = []
+            if 'result' in info and 'items' in info['result']:
+                items_in_response = info['result']['items']
+            elif 'items' in info:
+                items_in_response = info['items']
+            elif isinstance(info.get('result'), list):
+                items_in_response = info['result']
+            for it in items_in_response or []:
+                oid = clean_offer_id(it.get('offer_id'))
+                if not oid:
+                    continue
+                pid = it.get('id') or it.get('product_id')
+                if pid is not None:
+                    try:
+                        offer_id_to_product_id[oid] = int(pid)
+                    except Exception:
+                        pass
+                dcid = it.get('description_category_id')
+                if dcid is not None:
+                    try:
+                        offer_id_to_dcid[oid] = int(dcid)
+                    except Exception:
+                        pass
+                tpid = it.get('type_id')
+                if tpid is not None:
+                    try:
+                        offer_id_to_type_id[oid] = int(tpid)
+                    except Exception:
+                        pass
+
+        # Кеш meta атрибутов по (dcid,type_id)
+        meta_cache: dict[tuple[int, int], list[dict]] = {}
+        resolved_attr_ids: dict[tuple[int, int], dict[str, int | None]] = {}
+
+        def _pick_attr_id(attrs: list[dict], kind: str) -> int | None:
+            # kind: 'color' | 'size'
+            if not attrs:
+                return None
+            kind = kind.lower().strip()
+
+            if kind == 'color':
+                preferred = {
+                    'цвет',
+                    'цвет товара',
+                    'основной цвет',
+                    'цвет (основной)',
+                    'основной цвет товара',
+                }
+                keywords = ('цвет', 'color', 'colour')
+            else:
+                preferred = {
+                    'размер',
+                    'размер (ru)',
+                    'размер ru',
+                    'российский размер',
+                    'размер производителя',
+                    'размер одежды',
+                }
+                keywords = ('размер', 'size')
+
+            best_id = None
+            best_score = -1
+            for a in attrs:
+                name = str(a.get('name') or '').strip().lower()
+                if not name:
+                    continue
+                score = 0
+                if name in preferred:
+                    score += 100
+                if any(k in name for k in keywords):
+                    score += 20
+                # лёгкий плюс за не-collection (для размера чаще одно значение)
+                if kind != 'color' and not bool(a.get('is_collection')):
+                    score += 5
+                if score > best_score:
+                    try:
+                        best_id = int(a.get('id'))
+                        best_score = score
+                    except Exception:
+                        continue
+            return best_id
+
+        def _get_attr_ids_for_pair(dcid: int, tpid: int) -> dict[str, int | None]:
+            key = (int(dcid), int(tpid))
+            if key in resolved_attr_ids:
+                return resolved_attr_ids[key]
+            if key not in meta_cache:
+                resp = ozon.get_description_category_attributes(key[0], key[1], language='DEFAULT')
+                meta_cache[key] = (resp or {}).get('result') or []
+            attrs = meta_cache.get(key) or []
+            ids = {
+                'color': _pick_attr_id(attrs, 'color'),
+                'size': _pick_attr_id(attrs, 'size'),
+            }
+            resolved_attr_ids[key] = ids
+            return ids
+
+        product_ids = list({pid for pid in offer_id_to_product_id.values() if pid is not None})
+        # батчим, чтобы не было таймаутов
+        for chunk in chunk_list_fn(product_ids, 250):
+            attrs_resp = ozon.get_product_info_attributes(chunk)
+            for info_item in (attrs_resp or {}).get('result') or []:
+                oid = clean_offer_id(info_item.get('offer_id'))
+                if not oid:
+                    continue
+                dcid = offer_id_to_dcid.get(oid)
+                tpid = offer_id_to_type_id.get(oid)
+                if not dcid or not tpid:
+                    continue
+                ids = _get_attr_ids_for_pair(dcid, tpid)
+
+                color_attr_id = ids.get('color')
+                if color_attr_id:
+                    str_vals, _ = extract_attribute_values_from_product_attributes(info_item, int(color_attr_id))
+                    if str_vals:
+                        offer_id_to_color[oid] = ", ".join([v for v in str_vals if str(v).strip()])
+
+                size_attr_id = ids.get('size')
+                if size_attr_id:
+                    str_vals, _ = extract_attribute_values_from_product_attributes(info_item, int(size_attr_id))
+                    if str_vals:
+                        offer_id_to_size[oid] = ", ".join([v for v in str_vals if str(v).strip()])
+
         raw_data = []
         for offer_id, data in stock_dict.items():
-            name = data['name']
+            category = data.get('category', '—')
             available = data['available_stock_count']
             returning = data['return_from_customer_stock_count']
             prepare = data['valid_stock_count']
             total = available + returning + prepare
             raw_data.append({
-                'Наименование': name,
+                'Категория': category,
                 'Артикул': offer_id,
                 'Доступно на складах': available,
                 'Возвращаются от покупателей': returning,
@@ -363,9 +619,9 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                 'Итого на МП': total
             })
 
-        df_raw = pd.DataFrame(raw_data).sort_values(by='Наименование', key=lambda x: x.str.lower()).reset_index(
+        df_raw = pd.DataFrame(raw_data).sort_values(by='Категория', key=lambda x: x.str.lower()).reset_index(
             drop=True)
-        headers_raw = ["Наименование", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+        headers_raw = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
                        "Подготовка к продаже", "Итого на МП"]
 
         # === 2. Отчёт по шаблону Nimba/Galioni ===
@@ -380,6 +636,8 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
 
         template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id(sheet_name)
 
+        linked_template_ids = set(template_id_to_cabinet_arts.keys())
+
         # Получаем main_ids_ordered — ID в порядке появления в Excel (без дубликатов)
         template_path = os.path.join(root_dir, "База данных артикулов для выкупов и начислений.xlsx")
         if not os.path.exists(template_path):
@@ -393,6 +651,16 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                 if tid not in seen:
                     main_ids_ordered.append(tid)
                     seen.add(tid)
+
+        cabinet_arts_set = set()
+        for arts in template_id_to_cabinet_arts.values():
+            for art in arts:
+                cabinet_arts_set.add(normalize_art(art))
+
+        template_rows_to_color = []
+        for idx, id_val in enumerate(main_ids_ordered, start=3):
+            if id_val in linked_template_ids:
+                template_rows_to_color.append(idx)
 
         # Подготовка stock_data
         stock_data = {}
@@ -446,6 +714,12 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
         headers_template = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "Подготовка к продаже",
                             "Итого на МП"]
 
+        thresholds = resolve_stock_thresholds(context, query.message.chat_id)
+        raw_rows_to_color = []
+        for idx, art in enumerate(df_raw["Артикул"], start=3):
+            if normalize_art(art) in cabinet_arts_set:
+                raw_rows_to_color.append(idx)
+
         # === Сводка по всем остаткам ===
         total_available = sum(data['available_stock_count'] for data in stock_dict.values())
         total_returning = sum(data['return_from_customer_stock_count'] for data in stock_dict.values())
@@ -466,7 +740,16 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
 
         # ✅ Создаём Excel с двумя листами
         report_path = "Ozon_Remains_Report.xlsx"
-        create_excel_with_two_sheets(df_raw, headers_raw, df_template, headers_template, report_path)
+        create_excel_with_two_sheets(
+            df_raw,
+            headers_raw,
+            df_template,
+            headers_template,
+            report_path,
+            thresholds=thresholds,
+            template_rows_to_color=template_rows_to_color,
+            raw_rows_to_color=raw_rows_to_color
+        )
 
         # 📤 Отправляем файл
         await query.message.reply_document(
@@ -509,7 +792,16 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
     return ConversationHandler.END
 
 
-def create_excel_with_two_sheets(df_raw, headers_raw, df_template, headers_template, filename):
+def create_excel_with_two_sheets(
+        df_raw,
+        headers_raw,
+        df_template,
+        headers_template,
+        filename,
+        thresholds=None,
+        template_rows_to_color=None,
+        raw_rows_to_color=None
+):
     """Создаёт Excel с двумя листами: сначала 'Остатки шаблон Nimba', затем 'Остатки исходные артикулы'"""
     wb = Workbook()
     wb.remove(wb.active)  # удаляем дефолтный лист
@@ -517,10 +809,14 @@ def create_excel_with_two_sheets(df_raw, headers_raw, df_template, headers_templ
     # Сначала — шаблон Nimba/Galioni
     ws1 = wb.create_sheet(title="Остатки шаблон Nimba")
     _write_sheet(ws1, df_template, headers_template, has_name=False)
+    if template_rows_to_color and thresholds:
+        apply_fill_to_cells(ws1, template_rows_to_color, [5], thresholds)
 
     # Затем — исходные артикулы
     ws2 = wb.create_sheet(title="Остатки исходные артикулы")
     _write_sheet(ws2, df_raw, headers_raw, has_name=True)
+    if raw_rows_to_color and thresholds:
+        apply_fill_to_cells(ws2, raw_rows_to_color, [6], thresholds)
 
     wb.save(filename)
 

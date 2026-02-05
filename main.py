@@ -2,7 +2,7 @@ import os
 import logging
 import warnings
 from telegram.warnings import PTBUserWarning
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -43,7 +43,12 @@ from states import (
     AUTO_REPORT_DAILY_TIME,
     AUTO_REPORT_START_TIME,
     AUTO_REPORT_START_DAY,
-    SELECTING_AUTO_REPORT_TYPE
+    SELECTING_AUTO_REPORT_TYPE,
+    SETTINGS_MENU,
+    SETTINGS_STOCK_RED,
+    SETTINGS_STOCK_YELLOW,
+    TZ_CABINET_SELECT,
+    TZ_WAIT_FILE
 )
 
 from handlers.ozon_remains_handler import (
@@ -94,9 +99,21 @@ from handlers.auto_report_handler import (
     handle_back_from_start_time,
     handle_select_report_type
 )
+from handlers.settings_handler import (
+    start_settings,
+    handle_settings_choice,
+    handle_stock_red_input,
+    handle_stock_yellow_input
+)
+from handlers.tz_handler import (
+    start_tz_generation,
+    handle_tz_cabinet_select,
+    handle_tz_file,
+)
 
 # Менеджер автоотчётов
 from utils.auto_report_manager import schedule_all_jobs
+from utils.menu import get_main_menu
 
 # Настройка логгирования
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -144,23 +161,6 @@ try:
 except Exception as e:
     logger.warning(f"⚠️ Ошибка инициализации базы данных: {e}")
     logger.warning("Будет использоваться чтение напрямую из Excel")
-
-
-def get_main_menu():
-    """Возвращает главное меню с кнопками"""
-    return ReplyKeyboardMarkup(
-        [
-            ["Продажи Ozon", "Продажи WB"],
-            ["Остатки товаров Ozon", "Остатки товаров WB"],
-            ["Остатки на всех МП"],
-            ["Автоотчёты"],
-            ["Генерация штрихкодов"],
-            ["Конвертация CSV в XLSX"],
-            ["Помощь"]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False
-    )
 
 
 def cleanup_user_data(context: CallbackContext):
@@ -226,6 +226,10 @@ async def select_action(update: Update, context: CallbackContext) -> int:
         return await start_barcode_generation(update, context)
     elif text == "Конвертация CSV в XLSX":
         return await start_csv_conversion(update, context)
+    elif text == "Настройки":
+        return await start_settings(update, context)
+    elif text == "Формирование ТЗ":
+        return await start_tz_generation(update, context)
     elif text == "Помощь":
         return await show_help(update, context)
     return SELECTING_ACTION
@@ -305,7 +309,7 @@ def main() -> None:
         states={
             SELECTING_ACTION: [
                 MessageHandler(filters.Regex(
-                    '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Остатки на всех МП|Автоотчёты|Генерация штрихкодов|Конвертация CSV в XLSX|Помощь)$'
+                    '^(Продажи Ozon|Продажи WB|Остатки товаров Ozon|Остатки товаров WB|Остатки на всех МП|Автоотчёты|Генерация штрихкодов|Конвертация CSV в XLSX|Формирование ТЗ|Настройки|Помощь)$'
                 ), select_action),
             ],
             WB_REMAINS_CABINET_CHOICE: [
@@ -334,7 +338,7 @@ def main() -> None:
             OZON_SALES_DATE_END: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sales_date_end),
             ],
-            # Прочие состояния
+            # Прочие состояние
             BARCODE_FILES: [
                 MessageHandler(filters.Document.FileExtension("xlsx"), handle_barcode_files),
                 MessageHandler(filters.Text("Все файлы отправлены"), generate_barcode_report),
@@ -371,6 +375,21 @@ def main() -> None:
             ],
             SELECTING_AUTO_REPORT_TYPE: [
                 CallbackQueryHandler(handle_select_report_type)
+            ],
+            SETTINGS_MENU: [
+                CallbackQueryHandler(handle_settings_choice)
+            ],
+            SETTINGS_STOCK_RED: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stock_red_input)
+            ],
+            SETTINGS_STOCK_YELLOW: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stock_yellow_input)
+            ],
+            TZ_CABINET_SELECT: [
+                CallbackQueryHandler(handle_tz_cabinet_select),
+            ],
+            TZ_WAIT_FILE: [
+                MessageHandler(filters.Document.FileExtension("xlsx"), handle_tz_file),
             ],
         },
         fallbacks=[CommandHandler('start', start)],
