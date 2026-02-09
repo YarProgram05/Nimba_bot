@@ -703,6 +703,9 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
     try:
         wb_api = WildberriesAPI(cabinet_id=cabinet_id)
 
+        # all_cards нужен ниже и в ветках ошибок; по умолчанию пустой
+        all_cards: list[dict] = []
+
         # === Диагностика content-api / stocks (как в Ozon: максимум фактов в лог) ===
         try:
             hc = wb_api.content_health_check()
@@ -713,6 +716,48 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         loading_msg2 = await query.message.reply_text("📊 Запрашиваю остатки по товарам...")
         context.user_data['wb_remains_loading_msg2_id'] = loading_msg2.message_id
         stocks = wb_api.get_fbo_stocks_v1()
+
+        # --- FIX: WB statistics-api может не вернуть товары с 0 остатками.
+        # Подмешиваем список всех карточек продавца из content-api и добавляем отсутствующие
+        # vendorCode как "0 остатки", чтобы выгружались АБСОЛЮТНО все артикулы.
+        try:
+            all_cards = wb_api.get_all_cards(limit=100)  # внутри уже пагинация
+            all_vendor_codes: set[str] = set()
+            for c in (all_cards or []):
+                vc = (c.get("vendorCode") or c.get("vendorcode") or c.get("vendor_code"))
+                if vc is None:
+                    continue
+                vc_s = str(vc).strip()
+                if vc_s:
+                    all_vendor_codes.add(clean_article(vc_s))
+
+            if all_vendor_codes:
+                present_vendor_codes: set[str] = set()
+                for it in (stocks or []):
+                    vc = it.get("supplierArticle")
+                    if vc is None:
+                        continue
+                    vc_s = clean_article(vc)
+                    if vc_s:
+                        present_vendor_codes.add(vc_s)
+
+                missing = sorted(all_vendor_codes - present_vendor_codes)
+                if missing:
+                    logger.warning(
+                        f"WB: statistics-api вернул не все артикулы. Добавляю 0-остатки для {len(missing)} карточек "
+                        f"(из content-api всего={len(all_vendor_codes)}, из stocks={len(present_vendor_codes)})"
+                    )
+                    for vc in missing:
+                        stocks.append({
+                            "supplierArticle": vc,
+                            "quantity": 0,
+                            "inWayToClient": 0,
+                            "inWayFromClient": 0,
+                            "quantityFull": 0,
+                            # категорию потом возьмём из карточки, если получится
+                        })
+        except Exception as e:
+            logger.warning(f"WB: не удалось подмешать карточки из content-api для 0-остатков: {e}")
 
         # Подробная диагностика первых строк stocks
         try:
@@ -730,11 +775,14 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         except Exception as e:
             logger.warning(f"WB stocks sample log error: {e}")
 
-        if not stocks:
+        if stocks is None:
+            stocks = []
+
+        if not stocks and not all_cards:
             await query.message.reply_text(
                 "ℹ️ Остатки не найдены. Возможные причины:\n"
-                "• У вас нет товаров на складах Wildberries (FBO)\n"
-                "• Токен не имеет доступа к остаткам",
+                "• У вас нет товаров в кабинете Wildberries\n"
+                "• Токен не имеет доступа к остаткам/карточкам",
                 reply_markup=ReplyKeyboardRemove()
             )
             return ConversationHandler.END
@@ -788,6 +836,43 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
             stock_dict[article]['in_stock'] += item.get('quantity', 0)
             stock_dict[article]['in_way_to_client'] += item.get('inWayToClient', 0)
             stock_dict[article]['in_way_from_client'] += item.get('inWayFromClient', 0)
+
+        # --- FIX: категория для 0-остатков (добавленных из content-api) ---
+        # В statistics-api у таких строк обычно нет subject/category, поэтому подставляем из карточек content-api.
+        try:
+            cards_index: dict[str, dict] = {}
+            for c in (all_cards or []):
+                if not isinstance(c, dict):
+                    continue
+                vc = c.get("vendorCode") or c.get("vendor_code") or c.get("vendorcode")
+                vc_s = clean_article(vc)
+                if vc_s:
+                    cards_index[vc_s] = c
+
+            filled = 0
+            for art in list(stock_dict.keys()):
+                cur = category_by_article.get(art)
+                if cur and str(cur).strip() and str(cur).strip() != "—":
+                    continue
+                card = cards_index.get(art)
+                if not card:
+                    continue
+
+                cat = (
+                    card.get("subjectName")
+                    or card.get("objectName")
+                    or card.get("object")
+                    or card.get("subject")
+                    or card.get("category")
+                )
+                if cat is not None and str(cat).strip():
+                    category_by_article[art] = str(cat).strip()
+                    filled += 1
+
+            if filled:
+                logger.warning(f"WB: категория из content-api проставлена для {filled} артикулов (включая 0-остатки)")
+        except Exception as e:
+            logger.warning(f"WB: не удалось заполнить категорию из content-api: {e}")
 
         # === 1.1. Состав материала через nmId (card API) ===
         # Кеши в рамках одного запуска

@@ -539,12 +539,68 @@ async def fetch_wb_remains_raw(cabinet_id):
                 f"WB кабинет {cabinet_id}: get_fbo_stocks_v1 строк={len(stocks or [])} за {time.time() - t0:.2f}s"
             )
 
+            # --- FIX: statistics-api может не включать товары с 0 остатками (или вообще не было движений по FBO).
+            # Подмешиваем список всех карточек продавца из content-api и добавляем отсутствующие supplierArticle как 0.
+            all_cards: list[dict] = []
+            cards_index: dict[str, dict] = {}
+            try:
+                all_cards = wb.get_all_cards(limit=100)
+                all_vendor_codes: set[str] = set()
+                for c in (all_cards or []):
+                    vc = (c.get("vendorCode") or c.get("vendorcode") or c.get("vendor_code"))
+                    if vc is None:
+                        continue
+                    vc_s = clean_article(vc)
+                    if vc_s:
+                        all_vendor_codes.add(vc_s)
+                        cards_index[vc_s] = c
+
+                if all_vendor_codes:
+                    present_vendor_codes: set[str] = set()
+                    for it in (stocks or []):
+                        vc = clean_article(it.get("supplierArticle"))
+                        if vc:
+                            present_vendor_codes.add(vc)
+
+                    missing = sorted(all_vendor_codes - present_vendor_codes)
+                    if missing:
+                        logger.warning(
+                            f"WB кабинет {cabinet_id}: добавляю 0-остатки для {len(missing)} карточек "
+                            f"(content-api={len(all_vendor_codes)}, stocks={len(present_vendor_codes)})"
+                        )
+                        if stocks is None:
+                            stocks = []
+                        for vc in missing:
+                            stocks.append({
+                                "supplierArticle": vc,
+                                "quantity": 0,
+                                "inWayToClient": 0,
+                                "inWayFromClient": 0,
+                                "quantityFull": 0,
+                            })
+            except Exception as e:
+                logger.warning(f"WB кабинет {cabinet_id}: не удалось подмешать карточки из content-api для 0-остатков: {e}")
+
             for item in (stocks or []):
                 art = clean_article(item.get("supplierArticle"))
                 if not art:
                     continue
 
                 category = item.get("subject") or item.get("category") or "—"
+
+                # FIX: если category пустая (часто у 0-остатков), берём из content-карточки по vendorCode
+                if (not str(category).strip()) or str(category).strip() == "—":
+                    card = cards_index.get(art)
+                    if isinstance(card, dict):
+                        cat2 = (
+                            card.get("subjectName")
+                            or card.get("objectName")
+                            or card.get("object")
+                            or card.get("subject")
+                            or card.get("category")
+                        )
+                        if cat2 is not None and str(cat2).strip():
+                            category = str(cat2).strip()
 
                 quantity = item.get('quantity', 0) or 0
                 in_way_to_client = item.get('inWayToClient', 0) or 0
