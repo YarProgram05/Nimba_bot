@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def detect_encoding_simple(file_path):
-    """Простое определение кодировки без внешних библиотек"""
+    """Простое определение кодировки без внешних библиотек./"""
     encodings_to_try = ['utf-8', 'utf-8-sig', 'windows-1251', 'cp1251', 'latin-1']
 
     for encoding in encodings_to_try:
