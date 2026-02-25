@@ -12,6 +12,83 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 
+# --- helpers для мэтчинга finance.operation_id с posting/order ---
+
+def _normalize_op_key(value):
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def _normalize_match_key(value):
+    """Нормализация для сопоставления ключей (игнорируем регистр, пробелы и дефисы)."""
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    return s.replace(" ", "").replace("-", "")
+
+
+def _op_matches_order_keys(op: dict, order_keys_norm: set[str]) -> bool:
+    """Проверяет, относится ли операция к заказам периода.
+
+    В /v3/finance/transaction/list идентификатор постинга обычно лежит в поле `posting`.
+    Поле `posting_number` часто отсутствует/None.
+    """
+    candidates = [
+        op.get("posting"),
+        op.get("posting_number"),
+        op.get("operation_id"),
+        op.get("comments"),
+        op.get("operation_type_name"),
+        op.get("type"),
+    ]
+
+    for val in candidates:
+        norm = _normalize_match_key(val)
+        if not norm:
+            continue
+        if norm in order_keys_norm:
+            return True
+        for k in order_keys_norm:
+            if k and k in norm:
+                return True
+
+    return False
+
+
+def _parse_ozon_op_date(op: dict):
+    """Парсинг даты операции из finance/transaction/list (operation_date/date)."""
+    raw = op.get("operation_date") or op.get("date")
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+
+    # запасной формат
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+# --- конец helpers ---
+
 # Настройка путей
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
@@ -293,15 +370,33 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
             all_postings.extend(postings)
             await asyncio.sleep(0.1)
 
-        # === Финансы: по календарным месяцам (как раньше) ===
-        finance_chunks = split_by_calendar_months(start_dt, end_dt)
+        # === Список ключей заказов для мэтчинга с finance.operation_id ===
+        order_keys: set[str] = set()
+        order_keys_norm: set[str] = set()
+        for p in all_postings:
+            posting_number = _normalize_op_key(p.get("posting_number"))
+            order_number = _normalize_op_key(p.get("order_number"))
+            if posting_number:
+                order_keys.add(posting_number)
+            if order_number:
+                order_keys.add(order_number)
+
+        for k in order_keys:
+            kn = _normalize_match_key(k)
+            if kn:
+                order_keys_norm.add(kn)
+
+        logger.info(f"[OZON SALES] Ключей заказов для мэтчинга: {len(order_keys)}")
+
+        # === Финансы: расширяем конец периода на +14 дней ===
+        end_dt_ext = end_dt + timedelta(days=14)
+        finance_chunks = split_by_calendar_months(start_dt, end_dt_ext)
         all_operations = []
         for i, (chunk_start, chunk_end) in enumerate(finance_chunks, 1):
             logger.info(f"Запрос финансов {i}/{len(finance_chunks)}: {chunk_start.date()} – {chunk_end.date()}")
             start_iso = chunk_start.strftime("%Y-%m-%dT00:00:00.000Z")
             end_iso = chunk_end.strftime("%Y-%m-%dT23:59:59.999Z")
 
-            # Retry-логика (оставляем для надёжности)
             ops = None
             for attempt in range(3):
                 try:
@@ -309,7 +404,8 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                     break
                 except Exception as e:
                     if any(code in str(e) for code in ["504", "502", "timeout"]):
-                        logger.warning(f"⚠️ Финансы: попытка {attempt + 1}/3 провалена для {chunk_start.date()}")
+                        logger.warning(
+                            f"⚠️ Финансы: попытка {attempt + 1}/3 провалена для {chunk_start.date()}")
                         if attempt < 2:
                             await asyncio.sleep(2 ** attempt)
                             continue
@@ -349,8 +445,40 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         # === Обработка финансов ===
         operations = all_operations
-        skus = set()
+
+        # Собираем SKU только по "артикульным" операциям, которые реально относятся к заказам периода.
+        # (иначе на SKU будет лишняя работа и риск подтянуть лишние суммы)
+        matched_item_ops = []
+        service_ops = []
+        unmatched_item_ops = 0
+        missing_op_id = 0
+
         for op in operations:
+            items = op.get("items", [])
+            if items:
+                op_key_for_log = (
+                    _normalize_op_key(op.get("posting"))
+                    or _normalize_op_key(op.get("posting_number"))
+                    or _normalize_op_key(op.get("operation_id"))
+                )
+                if not op_key_for_log:
+                    missing_op_id += 1
+                    continue
+
+                if _op_matches_order_keys(op, order_keys_norm):
+                    matched_item_ops.append(op)
+                else:
+                    unmatched_item_ops += 1
+            else:
+                service_ops.append(op)
+
+        logger.info(
+            f"[OZON SALES] Finance ops: total={len(operations)}, item_matched={len(matched_item_ops)}, "
+            f"item_unmatched={unmatched_item_ops}, item_no_key={missing_op_id}, service={len(service_ops)}"
+        )
+
+        skus = set()
+        for op in matched_item_ops:
             for item in op.get("items", []):
                 sku = item.get("sku")
                 if sku is not None:
@@ -386,7 +514,9 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         # === Доход по артикулам ===
         income = {}
-        for op in operations:
+
+        # 1) Артикульные начисления — только совпавшие по operation_id
+        for op in matched_item_ops:
             amount = op.get("amount", 0)
             if amount == 0:
                 continue
@@ -394,24 +524,49 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
             items = op.get("items", [])
             operation_type_name = op.get("operation_type_name", "").strip()
 
-            if items:
-                offer_ids_found = []
-                for item in items:
-                    sku = item.get("sku")
-                    if sku is not None:
-                        offer_id = sku_to_offer.get(str(sku))
-                        if offer_id:
-                            offer_ids_found.append(offer_id)
-                if offer_ids_found:
-                    split_amount = amount / len(offer_ids_found)
-                    for offer_id in offer_ids_found:
-                        income[offer_id] = income.get(offer_id, 0) + split_amount
-                else:
-                    art = f"тип_начисления: {operation_type_name or op.get('type', 'other')}"
-                    income[art] = income.get(art, 0) + amount
+            offer_ids_found = []
+            for item in items:
+                sku = item.get("sku")
+                if sku is not None:
+                    offer_id = sku_to_offer.get(str(sku))
+                    if offer_id:
+                        offer_ids_found.append(offer_id)
+
+            if offer_ids_found:
+                split_amount = amount / len(offer_ids_found)
+                for offer_id in offer_ids_found:
+                    income[offer_id] = income.get(offer_id, 0) + split_amount
             else:
+                # Если операция относится к заказу периода (operation_id сматчен), но SKU не распознаны —
+                # не теряем сумму: складываем как сервисный тип начисления.
                 art = f"тип_начисления: {operation_type_name or op.get('type', 'other')}"
                 income[art] = income.get(art, 0) + amount
+
+        # 2) Сервисные начисления — строго в период пользователя (без расширения +14 дней)
+        service_in_range = 0
+        service_out_of_range = 0
+        for op in service_ops:
+            amount = op.get("amount", 0)
+            if amount == 0:
+                continue
+
+            op_dt = _parse_ozon_op_date(op)
+            if op_dt is None:
+                # если даты нет — ведём себя консервативно: считаем, что операция в период не попала
+                service_out_of_range += 1
+                continue
+
+            if start_dt <= op_dt <= end_dt:
+                operation_type_name = op.get("operation_type_name", "").strip()
+                art = f"тип_начисления: {operation_type_name or op.get('type', 'other')}"
+                income[art] = income.get(art, 0) + amount
+                service_in_range += 1
+            else:
+                service_out_of_range += 1
+
+        logger.info(
+            f"[OZON SALES] Service ops: in_range={service_in_range}, out_of_range={service_out_of_range}"
+        )
 
         total_income = sum(income.values())
 
@@ -871,3 +1026,4 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
             ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
 
     wb.save(output_path)
+

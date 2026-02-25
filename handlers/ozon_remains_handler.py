@@ -158,6 +158,45 @@ class OzonAPI:
             logger.error(f"Ошибка при получении attributes товаров: {e}")
             return None
 
+
+    def get_analytics_stocks_clustered(self, skus: list[int], cluster_ids: list[int] | None = None) -> list[dict]:
+        """/v1/analytics/stocks с разрезом по кластерам/складам.
+
+        Важно: skus <= 100.
+        """
+        url = f"{self.base_url}/v1/analytics/stocks"
+        skus_clean: list[int] = []
+        for s in skus or []:
+            try:
+                skus_clean.append(int(s))
+            except Exception:
+                continue
+        if not skus_clean:
+            return []
+
+        payload: dict = {
+            "skus": [str(x) for x in skus_clean],
+            "turnover_grades": [
+                "TURNOVER_GRADE_NONE", "DEFICIT", "POPULAR", "ACTUAL", "SURPLUS",
+                "NO_SALES", "WAS_NO_SALES", "RESTRICTED_NO_SALES", "COLLECTING_DATA",
+                "WAITING_FOR_SUPPLY", "WAS_DEFICIT", "WAS_POPULAR", "WAS_ACTUAL", "WAS_SURPLUS"
+            ],
+        }
+        if cluster_ids:
+            payload["cluster_ids"] = [str(int(x)) for x in cluster_ids if x is not None]
+
+        try:
+            resp = requests.post(url, json=payload, headers=self.headers, timeout=90)
+            if resp.status_code != 200:
+                logger.warning(f"Ozon /v1/analytics/stocks clustered -> {resp.status_code}: {resp.text}")
+                return []
+            data = resp.json() or {}
+            return data.get("items") or []
+        except Exception as e:
+            logger.warning(f"Ozon /v1/analytics/stocks clustered exception: {e}")
+            return []
+
+
 def _build_type_name_map_from_tree(tree_result: list) -> dict[tuple[int, int], str]:
     """Строит маппинг (description_category_id, type_id) -> type_name.
 
@@ -370,9 +409,11 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
             if offer_id:
                 offer_ids.append(offer_id)
 
+        # === Подтягиваем info/list один раз: sku + name + category ===
         all_skus = []
         offer_id_to_name = {}
         offer_id_to_category = {}
+        offer_id_to_sku: dict[str, int] = {}
 
         for chunk in chunk_list_fn(offer_ids, 1000):
             product_info_response = ozon.get_product_info_list(offer_ids=chunk)
@@ -390,20 +431,170 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                 continue
 
             for item_info in items_in_response:
-                offer_id = clean_offer_id(item_info.get('offer_id'))
+                oid = clean_offer_id(item_info.get('offer_id'))
                 sku = item_info.get('sku')
                 name = item_info.get('name', '—')
-                # Вместо общей категории берём узкую (type_name) из дерева категорий
                 category = _resolve_ozon_narrow_category(item_info, type_name_map)
-                if offer_id and sku:
-                    all_skus.append(sku)
-                    offer_id_to_name[offer_id] = name
-                    offer_id_to_category[offer_id] = category
+                if oid and sku:
+                    try:
+                        sku_int = int(sku)
+                    except Exception:
+                        continue
+                    all_skus.append(sku_int)
+                    offer_id_to_sku[oid] = sku_int
+                    offer_id_to_name[oid] = name
+                    offer_id_to_category[oid] = category
 
             time.sleep(0.5)
 
         if not all_skus:
             raise Exception("Не удалось получить SKU")
+
+        # === NEW: Остатки по кластерам через /v1/analytics/stocks (кластерный разрез) ===
+        cluster_sheet_df = None
+        cluster_sheet_headers = None
+        try:
+            # --- правило ручной категории "Туники детские" ---
+            # Шаблонные артикулы, для которых все привязанные исходные offer_id должны считаться категорией "Туники детские".
+            CHILD_TUNICS_TEMPLATES = {
+                'детская туника белая',
+                'детская туника розовая',
+                'детская туника голубая',
+                'детская туника фиолетовая',
+            }
+
+            # Пытаемся построить множество исходных артикулах (offer_id), которые привязаны к этим шаблонам
+            child_tunics_offer_ids_norm: set[str] = set()
+            try:
+                sheet_map_tmp = {
+                    1: "Отдельно Озон Nimba",
+                    2: "Отдельно Озон Galioni",
+                    3: "Отдельно Озон AGNIA",
+                }
+                sheet_name_tmp = sheet_map_tmp.get(cabinet_id)
+                if sheet_name_tmp:
+                    template_id_to_name_tmp, template_id_to_cabinet_arts_tmp = get_cabinet_articles_by_template_id(sheet_name_tmp)
+                    for tid, tname in (template_id_to_name_tmp or {}).items():
+                        if normalize_art(tname) in CHILD_TUNICS_TEMPLATES:
+                            for art in template_id_to_cabinet_arts_tmp.get(tid) or []:
+                                norm = normalize_art(art)
+                                if norm:
+                                    child_tunics_offer_ids_norm.add(norm)
+                logger.info(f"Ozon кабинет {cabinet_id}: child tunics linked offer_ids={len(child_tunics_offer_ids_norm)}")
+            except Exception as e:
+                logger.warning(f"Ozon кабинет {cabinet_id}: не удалось построить список детских туник из базы: {e}")
+
+            # 1) берем список кластеров (для информации)
+            url_clusters = f"{ozon.base_url}/v1/cluster/list"
+            resp_clusters = requests.post(
+                url_clusters,
+                json={"cluster_type": "CLUSTER_TYPE_OZON"},
+                headers=ozon.headers,
+                timeout=60,
+            )
+            cluster_ids: list[int] = []
+            if resp_clusters.status_code == 200:
+                data_clusters = resp_clusters.json() or {}
+                for cl in (data_clusters.get("clusters") or []):
+                    cid = cl.get("id")
+                    try:
+                        if cid is not None:
+                            cluster_ids.append(int(cid))
+                    except Exception:
+                        continue
+            logger.info(f"Ozon кабинет {cabinet_id}: clusters list ids={len(cluster_ids)}")
+
+            t0 = time.time()
+            rows_raw: list[dict] = []
+            uniques_clusters: set[str] = set()
+
+            # ВАЖНО: не передаём cluster_ids, чтобы получить полный разрез
+            for sku_chunk in chunk_list_fn(list(set(all_skus)), 100):
+                items_clustered = ozon.get_analytics_stocks_clustered(skus=sku_chunk, cluster_ids=None)
+                for it in items_clustered or []:
+                    oid = clean_offer_id(it.get("offer_id"))
+                    if not oid:
+                        continue
+                    cname = str(it.get("cluster_name") or it.get("clusterName") or "—").strip() or "—"
+                    qty = it.get("available_stock_count")
+                    try:
+                        qty_int = int(qty) if qty is not None else 0
+                    except Exception:
+                        qty_int = 0
+                    rows_raw.append({"Артикул": oid, "Кластер": cname, "Кол-во": qty_int})
+                    uniques_clusters.add(cname)
+
+            logger.info(
+                f"Ozon кабинет {cabinet_id}: /v1/analytics/stocks clustered rows={len(rows_raw)} clusters={len(uniques_clusters)} за {time.time() - t0:.2f}s"
+            )
+
+            # --- строим маппинг артикул -> категория (как в ТЗ), с ручным оверрайдом на "Туники детские" ---
+            # В offer_id_to_category (ключи в исходном регистре) могут быть расхождения, поэтому делаем нормализованный словарь.
+            offer_id_to_category_norm: dict[str, str] = {}
+            for k, v in (offer_id_to_category or {}).items():
+                nk = normalize_art(k)
+                if nk:
+                    offer_id_to_category_norm[nk] = v or '—'
+
+            # применяем ручную категорию
+            for norm_oid in child_tunics_offer_ids_norm:
+                offer_id_to_category_norm[norm_oid] = "Туники детские"
+
+            def _category_for_offer_id(oid: str) -> str:
+                n = normalize_art(oid)
+                return offer_id_to_category_norm.get(n, '—')
+
+            if rows_raw:
+                df_long = pd.DataFrame(rows_raw)
+
+                # Подмешиваем категорию к каждой строке
+                df_long.insert(0, "Категория", df_long["Артикул"].map(_category_for_offer_id))
+
+                # Агрегируем сразу по категориям/кластерам
+                df_cat = df_long.pivot_table(
+                    index="Категория",
+                    columns="Кластер",
+                    values="Кол-во",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+
+                df_cat.reset_index(inplace=True)
+                cluster_names = [c for c in df_cat.columns if c != "Категория"]
+                cluster_names_sorted = sorted(cluster_names, key=lambda x: str(x).lower())
+                df_cat = df_cat[["Категория", *cluster_names_sorted]]
+                df_cat["ВСЕГО"] = df_cat[cluster_names_sorted].sum(axis=1)
+
+                cluster_sheet_df = df_cat.sort_values(
+                    by="Категория",
+                    key=lambda x: x.astype(str).str.lower(),
+                ).reset_index(drop=True)
+                cluster_sheet_headers = ["Категория", *cluster_names_sorted, "ВСЕГО"]
+
+                # # Пустая строка + ИТОГО - УБИРАЕМ ПО ПРОСЬБЕ
+                # empty_row = {k: "" for k in cluster_sheet_headers}
+                # totals = {"Категория": "ИТОГО"}
+                # for cn in cluster_names_sorted:
+                #     totals[cn] = int(cluster_sheet_df[cn].sum())
+                # totals["ВСЕГО"] = int(cluster_sheet_df["ВСЕГО"].sum())
+                #
+                # cluster_sheet_df = pd.concat(
+                #     [
+                #         cluster_sheet_df,
+                #         pd.DataFrame([empty_row]),
+                #         pd.DataFrame([totals]),
+                #     ],
+                #     ignore_index=True,
+                # )
+            else:
+                # если вообще нет данных clustered, всё равно кладём пустую табличку
+                cluster_sheet_df = pd.DataFrame([], columns=["Категория", "ВСЕГО"])
+                cluster_sheet_headers = ["Категория", "ВСЕГО"]
+
+        except Exception as e:
+            logger.warning(
+                f"Ozon кабинет {cabinet_id}: не удалось сформировать лист по кластерам через /v1/analytics/stocks: {e}"
+            )
 
         stock_dict = {}
 
@@ -425,7 +616,9 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                         'category': offer_id_to_category.get(offer_id, '—'),
                         'available_stock_count': item.get('available_stock_count', 0),
                         'return_from_customer_stock_count': item.get('return_from_customer_stock_count', 0),
-                        'valid_stock_count': item.get('valid_stock_count', 0)
+                        'valid_stock_count': item.get('valid_stock_count', 0),
+                        'ads': item.get('ads', 0),
+                        'idc': item.get('idc', 0)
                     }
             time.sleep(0.5)
 
@@ -460,7 +653,9 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
                         'category': category,
                         'available_stock_count': stocks.get('present', 0),
                         'return_from_customer_stock_count': 0,
-                        'valid_stock_count': stocks.get('reserved', 0)
+                        'valid_stock_count': stocks.get('reserved', 0),
+                        'ads': 0,
+                        'idc': 0
                     }
 
                 time.sleep(0.5)
@@ -469,6 +664,7 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
         # --- Цвет и размер через /v4/product/info/attributes ---
         offer_id_to_color: dict[str, str] = {}
         offer_id_to_size: dict[str, str] = {}
+        offer_id_to_turnover: dict[str, float | int | None] = {}
 
         # Собираем product_id и мету (dcid/type_id) для offer_id
         offer_id_to_product_id: dict[str, int] = {}
@@ -610,19 +806,27 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
             returning = data['return_from_customer_stock_count']
             prepare = data['valid_stock_count']
             total = available + returning + prepare
+
+            ads = data.get('ads', '')
+            idc = data.get('idc', '')
+
             raw_data.append({
                 'Категория': category,
                 'Артикул': offer_id,
                 'Доступно на складах': available,
                 'Возвращаются от покупателей': returning,
                 'Подготовка к продаже': prepare,
-                'Итого на МП': total
+                'Итого на МП': total,
+                'Среднесуточные продажи (28 дн)': ads,
+                'Запас (дни)': idc,
             })
 
         df_raw = pd.DataFrame(raw_data).sort_values(by='Категория', key=lambda x: x.str.lower()).reset_index(
             drop=True)
-        headers_raw = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
-                       "Подготовка к продаже", "Итого на МП"]
+        headers_raw = [
+            "Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+            "Подготовка к продаже", "Итого на МП", "Среднесуточные продажи (28 дн)", "Запас (дни)"
+        ]
 
         # === 2. Отчёт по шаблону Nimba/Galioni ===
         sheet_map = {
@@ -748,13 +952,15 @@ async def handle_cabinet_choice(update: Update, context: CallbackContext) -> int
             report_path,
             thresholds=thresholds,
             template_rows_to_color=template_rows_to_color,
-            raw_rows_to_color=raw_rows_to_color
+            raw_rows_to_color=raw_rows_to_color,
+            df_clusters=cluster_sheet_df,
+            headers_clusters=cluster_sheet_headers,
         )
 
         # 📤 Отправляем файл
         await query.message.reply_document(
             document=open(report_path, 'rb'),
-            caption="📊 Отчёт по остаткам Ozon: два листа — исходные артикулы и шаблон Nimba/Galioni",
+            caption="📊 Отчёт по остаткам Ozon: исходные артикулы, шаблон + остатки по кластерам",
             reply_markup=ReplyKeyboardRemove()
         )
 
@@ -800,9 +1006,11 @@ def create_excel_with_two_sheets(
         filename,
         thresholds=None,
         template_rows_to_color=None,
-        raw_rows_to_color=None
+        raw_rows_to_color=None,
+        df_clusters=None,
+        headers_clusters=None,
 ):
-    """Создаёт Excel с двумя листами: сначала 'Остатки шаблон Nimba', затем 'Остатки исходные артикулы'"""
+    """Создаёт Excel с листами: 'Остатки шаблон Nimba', 'Остатки исходные артикулы' (+ опционально 'Остатки по кластерам')."""
     wb = Workbook()
     wb.remove(wb.active)  # удаляем дефолтный лист
 
@@ -817,6 +1025,11 @@ def create_excel_with_two_sheets(
     _write_sheet(ws2, df_raw, headers_raw, has_name=True)
     if raw_rows_to_color and thresholds:
         apply_fill_to_cells(ws2, raw_rows_to_color, [6], thresholds)
+
+    # NEW: Остатки по кластерам/складам
+    if df_clusters is not None and headers_clusters:
+        ws3 = wb.create_sheet(title="Остатки по кластерам")
+        _write_sheet(ws3, df_clusters, headers_clusters, has_name=False)
 
     wb.save(filename)
 

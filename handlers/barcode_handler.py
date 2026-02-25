@@ -118,6 +118,10 @@ def generate_label_pdf(row, output_dir):
         barcode_value = str(row['Баркод']).strip() if not pd.isna(row['Баркод']) else ''
         temp_file_path = None
 
+        # дефолтные размеры штрихкода, чтобы не ссылаться на неинициализированные переменные
+        barcode_width = 0
+        barcode_height = 0
+
         if barcode_value and CODE128_AVAILABLE:
             try:
                 # Создаем временную директорию для изображения штрихкода
@@ -181,7 +185,7 @@ def generate_label_pdf(row, output_dir):
 
             # Текстовые данные с улучшенным оформлением
             # Заголовок (более крупный шрифт)
-            header_font_size = 9
+            header_font_size = 10.5
             c.setFont(font_name, header_font_size)
 
             # Начинаем текст ниже штрихкода
@@ -190,7 +194,7 @@ def generate_label_pdf(row, output_dir):
             else:
                 current_y = label_height - 12 * mm
 
-            line_height = 3 * mm  # Оптимизированное расстояние между строками
+            line_height = 3.0 * mm  # Оптимизированное расстояние между строками
             text_width_limit = label_width - 4 * mm  # Ширина для текста с отступами
 
             # Формирование данных
@@ -215,11 +219,11 @@ def generate_label_pdf(row, output_dir):
             # Добавляем остальные поля
             fields.extend([
                 ("Сост.:", row.get('Состав на бирке', '')),
-                ("", row.get('ИП', '')),
+                ("", row.get('Продавец', '')),
             ])
 
             # Вывод текста с автоматическим переносом и центрированием
-            normal_font_size = 7
+            normal_font_size = 8.5
             c.setFont(font_name, normal_font_size)
 
             for prefix, value in fields:
@@ -296,7 +300,7 @@ async def start_barcode_generation(update: Update, context: CallbackContext) -> 
         "• Цвет на бирке\n"
         "• Размер на бирке\n"
         "• Состав на бирке\n"
-        "• ИП\n"
+        "• Продавец\n"
         "После отправки файла нажмите кнопку ниже ⬇️",
         reply_markup=reply_markup
     )
@@ -469,3 +473,4 @@ async def generate_barcode_report(update: Update, context: CallbackContext) -> i
         )
 
     return ConversationHandler.END
+

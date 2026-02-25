@@ -166,7 +166,7 @@ class WildberriesAPI:
                 keys = list(data.keys())
                 cards = data.get("cards") or data.get("data") or []
                 cursor = data.get("cursor")
-                logger.warning(
+                logger.debug(
                     f"WB content-probe POST {path}: keys={keys} error={data.get('error')} errorText={data.get('errorText')} "
                     f"additionalErrors={data.get('additionalErrors')} cards_len={len(cards) if isinstance(cards, list) else type(cards)} "
                     f"cursorKeys={list(cursor.keys()) if isinstance(cursor, dict) else cursor} payload={payload}"
@@ -174,6 +174,20 @@ class WildberriesAPI:
             except Exception as e:
                 logger.warning(f"WB content-probe POST {path} exception: {e} payload={payload}")
                 continue
+
+    def search_cards_by_text(self, query: str, limit: int = 100) -> list[dict]:
+        """Fallback: поиск карточек через content-api по тексту.
+
+        Когда vendorCodes из statistics-api не совпадают с vendorCode в content,
+        можно попытаться найти карточку через textSearch.
+        """
+        q = str(query or "").strip()
+        if not q:
+            return []
+        payload = {"settings": {"cursor": {"limit": int(limit)}, "filter": {"textSearch": q, "withPhoto": -1}}}
+        data = self._content_post("/content/v2/get/cards/list", payload, timeout=60)
+        cards = (((data or {}).get("cards")) or ((data or {}).get("data")) or [])
+        return cards if isinstance(cards, list) else []
 
     def get_all_cards(self, limit: int = 50) -> list[dict]:
         """Получить все карточки продавца через content-api с пагинацией cursor.
@@ -226,11 +240,11 @@ class WildberriesAPI:
 
             time.sleep(0.2)
 
-        logger.info(f"WB content-api get_all_cards: получено карточек={len(all_cards)}")
+        logger.debug(f"WB content-api get_all_cards: получено карточек={len(all_cards)}")
         return all_cards
 
     def build_vendor_code_index(self, cards: list[dict]) -> dict[str, dict]:
-        """Индекс по vendorCode для быстрого поиска карточки."""
+        """Индекс по vendorCode для быстрого ��оиска карточки."""
         idx: dict[str, dict] = {}
         for c in cards or []:
             if not isinstance(c, dict):
@@ -239,20 +253,6 @@ class WildberriesAPI:
             if vc:
                 idx[vc] = c
         return idx
-
-    def search_cards_by_text(self, query: str, limit: int = 100) -> list[dict]:
-        """Fallback: поиск карточек через content-api по тексту.
-
-        Когда vendorCodes из statistics-api не совпадают с vendorCode в content,
-        можно попытаться найти карточку через textSearch.
-        """
-        q = str(query or "").strip()
-        if not q:
-            return []
-        payload = {"settings": {"cursor": {"limit": int(limit)}, "filter": {"textSearch": q, "withPhoto": -1}}}
-        data = self._content_post("/content/v2/get/cards/list", payload, timeout=60)
-        cards = (((data or {}).get("cards")) or ((data or {}).get("data")) or [])
-        return cards if isinstance(cards, list) else []
 
     def get_cards_by_vendor_codes(self, vendor_codes: list[str]) -> list[dict]:
         """Получает карточки по vendorCode.
@@ -275,7 +275,7 @@ class WildberriesAPI:
             }
             data = self._content_post("/content/v2/get/cards/list", payload, timeout=60)
             if data is None:
-                logger.warning(
+                logger.debug(
                     f"WB content-api get/cards/list: пустой ответ (None). "
                     f"vendorCodes(part)={len(part)} sample={part[:5]}"
                 )
@@ -290,8 +290,7 @@ class WildberriesAPI:
                 cards = []
 
             if not cards:
-                # Если карточек нет, очень важно понять что вернул API
-                logger.warning(
+                logger.debug(
                     "WB content-api get/cards/list: карточки не найдены. "
                     f"keys={list((data or {}).keys())} vendorCodes(part)={len(part)} sample={part[:10]} "
                     f"error={data.get('error')} errorText={data.get('errorText') or data.get('message') or ''}"
@@ -302,7 +301,7 @@ class WildberriesAPI:
             time.sleep(0.2)
 
         if not all_cards:
-            logger.warning(
+            logger.debug(
                 f"WB content-api get/cards/list: итого 0 карточек по {len(vendor_codes)} vendorCodes. "
                 f"Пробую fallback: загрузить все карточки и сматчить vendorCodes локально..."
             )
@@ -321,7 +320,7 @@ class WildberriesAPI:
                 if c:
                     matched.append(c)
 
-            logger.warning(
+            logger.debug(
                 f"WB content-api fallback get_all_cards: всего карточек={len(all_seller_cards)}, "
                 f"совпадений по vendorCodes={len(matched)}"
             )
@@ -382,6 +381,279 @@ class WildberriesAPI:
                 break
 
         return all_stocks
+
+    def get_stocks_report(self, nm_ids: list[int], debug_nm_ids: list[int] | None = None) -> list[dict]:
+        """Получить данные об оборачиваемости через Seller Analytics API.
+
+        Метод: https://seller-analytics-api.wildberries.ru/api/v2/stocks-report/products/products
+
+        Возвращает данные:
+        - saleRate: Оборачиваемость текущих остатков
+        - avgStockTurnover: Оборачиваемость средних остатков
+        - avgOrders: Среднее количество заказов в день
+        """
+        if not nm_ids:
+            return []
+
+        # Для диагностического логирования сырых items по конкретным nmID
+        debug_nm_ids_set: set[int] = set()
+        for x in (debug_nm_ids or []):
+            try:
+                debug_nm_ids_set.add(int(x))
+            except Exception:
+                pass
+
+        url = "https://seller-analytics-api.wildberries.ru/api/v2/stocks-report/products/products"
+
+        # Преобразуем в список целых чисел
+        nm_ids_clean = []
+        for nm_id in nm_ids:
+            try:
+                nm_ids_clean.append(int(nm_id))
+            except (ValueError, TypeError):
+                continue
+
+        if not nm_ids_clean:
+            return []
+
+        # Получаем текущую дату для фильтра
+        from datetime import datetime, timedelta
+        today = datetime.now().date()
+        start_date_short = today - timedelta(days=30)
+        today_str = today.strftime("%Y-%m-%d")
+        start_str_short = start_date_short.strftime("%Y-%m-%d")
+
+        def _format_days_hours(data):
+            def _cap(v: float) -> float:
+                return 999.0 if v > 999 else v
+
+            if data is None:
+                return ""
+            if isinstance(data, str):
+                s = data.strip().lower()
+                if not s:
+                    return ""
+                # '-1ч' / '-1д' и т.п. считаем как '>999' (по требованию записываем 999)
+                if s.startswith("-"):
+                    return 999
+                if "д" in s or "ч" in s:
+                    days = 0.0
+                    hours = 0.0
+                    if "д" in s:
+                        d_part, rest = s.split("д", 1)
+                        d_part = d_part.strip()
+                        if d_part:
+                            try:
+                                days = float(d_part)
+                            except Exception:
+                                return 999
+                        s = rest.strip()
+                    if "ч" in s:
+                        h_part = s.split("ч", 1)[0].strip()
+                        if h_part:
+                            try:
+                                hours = float(h_part)
+                            except Exception:
+                                return 999
+                    if days < 0 or hours < 0:
+                        return 999
+                    total = _cap(days + (hours / 24.0 if hours else 0.0))
+                    return round(total, 2)
+                try:
+                    val = float(s)
+                except Exception:
+                    return ""
+                if val < 0:
+                    return 999
+                return round(_cap(val), 2)
+            if not isinstance(data, dict):
+                try:
+                    val = float(data)
+                except Exception:
+                    return ""
+                if val < 0:
+                    return 999
+                return round(_cap(val), 2)
+            days = data.get("days")
+            hours = data.get("hours")
+            try:
+                days = float(days) if days is not None else None
+                hours = float(hours) if hours is not None else None
+            except Exception:
+                return 999
+            if (days is not None and days < 0) or (hours is not None and hours < 0):
+                return 999
+            total = _cap((days or 0.0) + ((hours or 0.0) / 24.0))
+            return round(total, 2)
+
+        availability_all = ["deficient", "actual", "balanced", "nonActual", "nonLiquid", "invalidData"]
+        stock_types = ["mp", "", "wb"]
+        base_payload = {
+            "currentPeriod": {"start": start_str_short, "end": today_str},
+            "skipDeletedNm": True,
+            "orderBy": {"field": "avgOrders", "mode": "asc"},
+            "availabilityFilters": availability_all,
+            "limit": 150,
+            "offset": 0
+        }
+
+        def _normalize_items(items: list[dict]) -> list[dict]:
+            """Нормализация элементов stocks-report: вытаскиваем метрики из `metrics`."""
+            result: list[dict] = []
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                nm_val = item.get("nmID") or item.get("nmId") or item.get("nmid")
+                try:
+                    nm_val = int(nm_val) if nm_val is not None else 0
+                except Exception:
+                    nm_val = 0
+
+                metrics = item.get("metrics") or {}
+                stock_count = metrics.get("stockCount")
+                try:
+                    stock_count = float(stock_count) if stock_count is not None else None
+                except Exception:
+                    stock_count = None
+
+                sale_rate = metrics.get("saleRate")
+                avg_stock_turnover = metrics.get("avgStockTurnover")
+                avg_orders = metrics.get("avgOrders", "")
+
+                if stock_count is not None and stock_count <= 0:
+                    sale_rate = 0.0
+                    avg_stock_turnover = 0.0
+
+                result.append({
+                    "nmID": nm_val,
+                    "saleRate": _format_days_hours(sale_rate),
+                    "avgStockTurnover": _format_days_hours(avg_stock_turnover),
+                    "avgOrders": avg_orders,
+                })
+            return result
+
+        def _request(payload: dict) -> list[dict]:
+            try:
+                response = requests.post(url, headers=self.headers, json=payload, timeout=60)
+            except Exception as e:
+                logger.warning(f"WB stocks-report API: request error: {e}")
+                return []
+            logger.info(f"WB stocks-report API: status={response.status_code}")
+            if response.status_code == 429:
+                logger.warning(f"WB stocks-report API: 429 - {response.text[:500]}")
+                # Перебор лимитов — прекращаем текущий цикл запросов
+                raise RuntimeError("WB stocks-report API rate limit (429)")
+            if response.status_code != 200:
+                logger.warning(f"WB stocks-report API: {response.status_code} - {response.text[:500]}")
+                return []
+
+            data = response.json() or {}
+            logger.info(f"WB stocks-report API response keys: {list(data.keys())}")
+
+            data_inner = data.get("data")
+            if isinstance(data_inner, dict):
+                items = data_inner.get("items") or []
+                # Сырые items больше не логируем (слишком шумно).
+                return _normalize_items(items if isinstance(items, list) else [])
+
+            if isinstance(data_inner, list):
+                # Сырые items больше не логируем (слишком шумно).
+                return _normalize_items(data_inner)
+
+            logger.warning("WB stocks-report API: data отсутствует или неизвестного формата")
+            return []
+
+        def _fetch_batches(nm_list: list[int], start_str_local: str) -> list[dict]:
+            result: list[dict] = []
+            for i in range(0, len(nm_list), 150):
+                part = nm_list[i:i + 150]
+                got_any = False
+                for st in stock_types:
+                    payload = dict(base_payload)
+                    payload["nmIDs"] = part
+                    payload["stockType"] = st
+                    payload["currentPeriod"] = {"start": start_str_local, "end": today_str}
+                    try:
+                        items_norm = _request(payload)
+                        if items_norm:
+                            result.extend(items_norm)
+                            got_any = True
+                            break
+                    except RuntimeError:
+                        # 429 — прекращаем дальнейшие запросы
+                        return result
+                    except Exception as e:
+                        logger.warning(f"Ошибка при получении данных stocks-report (stockType={st}): {e}")
+                        continue
+                if not got_any:
+                    logger.warning(f"WB stocks-report API: нет данных для nmIDs batch, пробовал stockType={stock_types}")
+                time.sleep(0.35)
+            return result
+
+        # Батчинг nmIDs, чтобы не перегружать API
+        result_all: list[dict] = _fetch_batches(nm_ids_clean, start_str_short)
+
+        # Убираем запрос на 365 дней (WB возвращает 400 invalid start day)
+        dedup: dict[int, dict] = {}
+        for it in result_all:
+            nm_raw = it.get("nmID") or it.get("nmId") or it.get("nmid")
+            try:
+                nm_val = int(nm_raw) if nm_raw is not None else 0
+            except Exception:
+                nm_val = 0
+            if nm_val:
+                dedup[nm_val] = it
+        missing = [nm for nm in nm_ids_clean if nm not in dedup]
+        if missing:
+            logger.warning(f"WB stocks-report API: недостающих nmID={len(missing)}; повторный запрос отключен из-за лимитов")
+
+        result_all = list(dedup.values())
+
+        # Fallback: запрос без nmIDs — только если не было 429
+        if not result_all:
+            logger.warning("WB stocks-report API: пустой результат по nmIDs, пробую запрос без nmIDs")
+            needed = set(nm_ids_clean)
+            collected: dict[int, dict] = {}
+            for st in stock_types:
+                offset = 0
+                for _ in range(0, 10):
+                    payload = dict(base_payload)
+                    payload["stockType"] = st
+                    payload["limit"] = 1000
+                    payload["offset"] = offset
+                    try:
+                        items_norm = _request(payload)
+                    except RuntimeError:
+                        return []
+                    if not items_norm:
+                        break
+                    for it in items_norm:
+                        nm_raw = it.get("nmID") or it.get("nmId") or it.get("nmid")
+                        try:
+                            nm_val = int(nm_raw) if nm_raw is not None else 0
+                        except Exception:
+                            continue
+                        if nm_val in needed and nm_val not in collected:
+                            collected[nm_val] = it
+                    if len(collected) >= len(needed):
+                        break
+                    offset += 1000
+                    time.sleep(0.35)
+                if collected:
+                    result_all.extend(list(collected.values()))
+                    break
+
+        # Дедуп по nmID
+        dedup_final: dict[int, dict] = {}
+        for it in result_all:
+            nm_raw = it.get("nmID") or it.get("nmId") or it.get("nmid")
+            try:
+                nm_val = int(nm_raw) if nm_raw is not None else 0
+            except Exception:
+                nm_val = 0
+            if nm_val:
+                dedup_final[nm_val] = it
+        return list(dedup_final.values())
 
     def get_card_by_nm_id(self, nm_id: int) -> dict | None:
         """Пытаемся получить карточку по nmId.
@@ -591,7 +863,7 @@ class WildberriesAPI:
 # ======================
 
 def normalize_art(art_str):
-    """Нормализует строку: приводит к нижнему регистру, удаляет лишние пробелы, очищает от невидимых символов"""
+    """Нормализует строку: приводит к нижнему регистру, удаляет лишние пробелы, очищает от невидимых ��имволов"""
     if not art_str:
         return ""
     s = str(art_str)
@@ -709,9 +981,9 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         # === Диагностика content-api / stocks (как в Ozon: максимум фактов в лог) ===
         try:
             hc = wb_api.content_health_check()
-            logger.warning(f"WB content-api health-check(before stocks): {hc}")
+            logger.debug(f"WB content-api health-check(before stocks): {hc}")
         except Exception as e:
-            logger.warning(f"WB content-api health-check(before stocks) error: {e}")
+            logger.debug(f"WB content-api health-check(before stocks) error: {e}")
 
         loading_msg2 = await query.message.reply_text("📊 Запрашиваю остатки по товарам...")
         context.user_data['wb_remains_loading_msg2_id'] = loading_msg2.message_id
@@ -743,7 +1015,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
 
                 missing = sorted(all_vendor_codes - present_vendor_codes)
                 if missing:
-                    logger.warning(
+                    logger.info(
                         f"WB: statistics-api вернул не все артикулы. Добавляю 0-остатки для {len(missing)} карточек "
                         f"(из content-api всего={len(all_vendor_codes)}, из stocks={len(present_vendor_codes)})"
                     )
@@ -764,16 +1036,15 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
             sample_rows = (stocks or [])[:2]
             for i, it in enumerate(sample_rows, start=1):
                 if isinstance(it, dict):
-                    logger.warning(
+                    logger.debug(
                         f"WB stocks sample #{i}: keys={list(it.keys())} "
                         f"supplierArticle={it.get('supplierArticle')} nmId={it.get('nmId') or it.get('nmID')} "
                         f"imtId={it.get('imtId') or it.get('imtID')} barcode={it.get('barcode')} chrtId={it.get('chrtId') or it.get('chrtID')}"
                     )
-                    # чтобы не засорять лог слишком сильно — полный dict только один раз
                     if i == 1:
-                        logger.warning(f"WB stocks sample #1 full: {it}")
+                        logger.debug(f"WB stocks sample #1 full: {it}")
         except Exception as e:
-            logger.warning(f"WB stocks sample log error: {e}")
+            logger.debug(f"WB stocks sample log error: {e}")
 
         if stocks is None:
             stocks = []
@@ -870,7 +1141,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                     filled += 1
 
             if filled:
-                logger.warning(f"WB: категория из content-api проставлена для {filled} артикулов (включая 0-остатки)")
+                logger.debug(f"WB: категория из content-api проставлена для {filled} артикулов (включая 0-остатки)")
         except Exception as e:
             logger.warning(f"WB: не удалось заполнить категорию из content-api: {e}")
 
@@ -894,6 +1165,30 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
             except Exception:
                 pass
 
+        # Дополняем nmId из content-api карточек (там часто есть nmID, которого нет в statistics-api)
+        try:
+            for c in (all_cards or []):
+                if not isinstance(c, dict):
+                    continue
+                vc = clean_article(c.get("vendorCode") or c.get("vendor_code") or c.get("vendorcode"))
+                nm = c.get("nmID") or c.get("nmId")
+                if vc and nm and vc not in nm_id_by_article:
+                    nm_id_by_article[vc] = int(nm)
+        except Exception as e:
+            logger.warning(f"WB: не удалось дополнить nmId из content-api: {e}")
+
+        debug_articles = {
+            "Халат/черный/лист",
+            "парео голубой",
+        }
+        debug_nm_ids: list[int] = []
+        for art in debug_articles:
+            nm_val = nm_id_by_article.get(art)
+            if nm_val:
+                debug_nm_ids.append(nm_val)
+            else:
+                logger.warning(f"WB stocks-report debug: nmId не найден для артикула '{art}'")
+
         # Диагностически попробуем вытащить состав по nmId для первых N товаров
         try:
             t_nm = time.time()
@@ -909,7 +1204,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                     composition_by_nm_id[nm] = comp
                     found_nm += 1
                 time.sleep(0.03)
-            logger.warning(f"WB nmId composition: checked={checked} found={found_nm} за {time.time()-t_nm:.2f}s")
+            logger.debug(f"WB nmId composition: checked={checked} found={found_nm} за {time.time()-t_nm:.2f}s")
         except Exception as e:
             logger.warning(f"WB nmId composition error: {e}")
 
@@ -919,7 +1214,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
             nm_ids = list({nm for nm in nm_id_by_article.values() if nm and int(nm) > 0})
             t_cards = time.time()
             cards = wb_api.get_cards_by_nm_ids(nm_ids)
-            logger.info(f"WB: get_cards_by_nm_ids карточек={len(cards or [])} за {time.time()-t_cards:.2f}s")
+            logger.debug(f"WB: get_cards_by_nm_ids карточек={len(cards or [])} за {time.time()-t_cards:.2f}s")
 
             by_nm: dict[int, dict] = {}
             for c in (cards or []):
@@ -942,25 +1237,100 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         except Exception as e:
             logger.warning(f"Не удалось получить цвет WB через content-api: {e}")
 
+        # === 1.2. Данные об оборачиваемости через Seller Analytics API ===
+        analytics_by_nm_id: dict[int, dict] = {}
+        try:
+            nm_ids_for_analytics = list({nm for nm in nm_id_by_article.values() if nm and int(nm) > 0})
+            if nm_ids_for_analytics:
+                t_analytics = time.time()
+                analytics_items = wb_api.get_stocks_report(nm_ids_for_analytics, debug_nm_ids=debug_nm_ids)
+                for item in (analytics_items or []):
+                    try:
+                        nm = int(item.get("nmID") or item.get("nmId") or 0)
+                    except Exception:
+                        continue
+                    if nm > 0:
+                        analytics_by_nm_id[nm] = {
+                            "saleRate": item.get("saleRate", ""),
+                            "avgStockTurnover": item.get("avgStockTurnover", ""),
+                            "avgOrders": item.get("avgOrders", "")
+                        }
+                logger.info(f"WB: get_stocks_report аналитика для {len(analytics_by_nm_id)} товаров за {time.time()-t_analytics:.2f}s")
+        except Exception as e:
+            logger.warning(f"Не удалось получить данные оборачиваемости WB: {e}")
+
+        def _coerce_turnover(value, total_stock: int) -> float | str:
+            if total_stock <= 0:
+                return 0.0
+            if isinstance(value, str):
+                s = value.strip().lower()
+                if not s:
+                    return value
+                # Убираем префикс '>' из вида '>999 д'
+                if s.startswith(">"):
+                    s = s[1:].strip()
+                # Приводим строки вида "999 д" или "123д 4ч" к числу дней
+                if "д" in s or "ч" in s:
+                    days = 0.0
+                    hours = 0.0
+                    if "д" in s:
+                        d_part, rest = s.split("д", 1)
+                        d_part = d_part.strip()
+                        if d_part:
+                            try:
+                                days = float(d_part)
+                            except Exception:
+                                return value
+                        s = rest.strip()
+                    if "ч" in s:
+                        h_part = s.split("ч", 1)[0].strip()
+                        if h_part:
+                            try:
+                                hours = float(h_part)
+                            except Exception:
+                                return value
+                    num = days + (hours / 24.0 if hours else 0.0)
+                    return 999.0 if num > 999 else round(num, 2)
+            try:
+                num = float(value)
+            except Exception:
+                return value
+            return 999.0 if num > 999 else round(num, 2)
+
         for article, counts in stock_dict.items():
             total = (
                     counts['in_stock'] +
                     counts['in_way_to_client'] +
                     counts['in_way_from_client']
             )
+
+            # Получаем данные об оборачиваемости по nmId этого артикула
+            nm_id = nm_id_by_article.get(article)
+            analytics = analytics_by_nm_id.get(nm_id, {}) if nm_id else {}
+
+            sale_rate = _coerce_turnover(analytics.get('saleRate', ''), total)
+            avg_turnover = _coerce_turnover(analytics.get('avgStockTurnover', ''), total)
+
             raw_data.append({
                 'Категория': category_by_article.get(article, '—'),
                 'Артикул': article,
                 'Доступно на складах': counts['in_stock'],
                 'Возвращаются от покупателей': counts['in_way_from_client'],
                 'В пути до покупателей': counts['in_way_to_client'],
-                'Итого на МП': total
+                'Итого на МП': total,
+                'Оборачиваемость текущих остатков': sale_rate,
+                'Оборачиваемость средних остатков': avg_turnover,
+                'Среднее кол-во заказов в день': analytics.get('avgOrders', '')
             })
 
         df_raw = pd.DataFrame(raw_data).sort_values(by='Артикул').reset_index(drop=True)
-        headers_raw = ["Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей", "Итого на МП"]
+        headers_raw = [
+            "Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
+            "В пути до покупателей", "Итого на МП", "Оборачиваемость текущих остатков",
+            "Оборачиваемость средних остатков", "Среднее кол-во заказов в день"
+        ]
 
-        # === 2. Группировка по шаблону Nimba/Galioni ===
+        # === 2. Группировка по шаблонту Nimba/Galioni ===
         template_id_to_name, template_id_to_cabinet_arts = get_cabinet_articles_by_template_id(sheet_name)
 
         linked_template_ids = set(template_id_to_cabinet_arts.keys())
