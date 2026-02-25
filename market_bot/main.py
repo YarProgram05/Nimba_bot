@@ -117,6 +117,9 @@ from utils.menu import get_main_menu
 
 # Настройка логгирования
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+logs_dir = os.path.join(project_root, 'other')
+os.makedirs(logs_dir, exist_ok=True)
 
 # Консольный обработчик
 console_handler = logging.StreamHandler()
@@ -124,12 +127,12 @@ console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter(log_format))
 
 # Файловый обработчик для всех логов
-file_handler = logging.FileHandler('../bot.log', encoding='utf-8')
+file_handler = logging.FileHandler(os.path.join(logs_dir, 'bot.log'), encoding='utf-8')
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter(log_format))
 
 # Файловый обработчик для ошибок
-error_handler = logging.FileHandler('../bot.err', encoding='utf-8')
+error_handler = logging.FileHandler(os.path.join(logs_dir, 'bot.err'), encoding='utf-8')
 error_handler.setLevel(logging.ERROR)
 error_handler.setFormatter(logging.Formatter(log_format))
 
