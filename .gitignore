@@ -3,6 +3,7 @@
 
 # Keep gitignore itself tracked
 !.gitignore
+!README.md
 
 # Track only the bot subdirectory
 !market_bot/
