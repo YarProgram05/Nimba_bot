@@ -34,6 +34,89 @@ from utils.template_loader import get_cabinet_articles_by_template_id
 from utils.template_loader import get_template_order
 
 
+def normalize_barcode(value) -> str:
+    if value is None:
+        return ""
+    return "".join(ch for ch in str(value) if ch.isdigit())
+
+
+def normalize_wb_size(value) -> str:
+    if value is None:
+        return "единый"
+    s = str(value).strip()
+    if not s:
+        return "единый"
+    s_up = s.upper()
+    if s_up in {"0", "ONE", "ONE SIZE", "ONESIZE", "ЕДИНЫЙ", "ЕДИНЫЙ РАЗМЕР"}:
+        return "единый"
+    src = s.replace("\\", "/")
+    m = re.search(r"(\d{2,3})\s*[-/]\s*(\d{2,3})", src)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    return s
+
+
+def build_wb_sales_key(article: str, size_value=None, barcode_value=None) -> tuple[str, str]:
+    base = str(article or "").strip().lower()
+    barcode = normalize_barcode(barcode_value)
+    size = normalize_wb_size(size_value)
+
+    display = str(article or "").strip()
+    if size and size != "единый" and size not in display:
+        display = f"{display} {size}"
+
+    if barcode:
+        return f"{base}__{barcode}", display
+    if size != "единый":
+        return f"{base}__size_{size}", display
+    return base, display
+
+
+def split_wb_sales_key(key: str) -> tuple[str, str, str]:
+    """Return (base_article, size, barcode)."""
+    s = str(key or "").strip().lower()
+    if "__" not in s:
+        return s, "единый", ""
+    base, suffix = s.split("__", 1)
+    if suffix.startswith("size_"):
+        return base, suffix[5:] or "единый", ""
+    if suffix.isdigit():
+        return base, "единый", suffix
+    return base, "единый", ""
+
+
+def drop_unified_base_sales_keys(
+    orders_data: dict,
+    purchases_data: dict,
+    cancels_data: dict,
+    income_data: dict,
+    art_original_case: dict,
+):
+    """
+    Удаляет базовый ключ артикула (без размера), если для этого же base есть размерные ключи.
+    Пример: удаляем `парео/детск/розовый`, если есть `парео/детск/розовый__size_92-110`.
+    """
+    all_keys = set(orders_data) | set(purchases_data) | set(cancels_data) | set(income_data)
+    sized_bases: set[str] = set()
+    for key in all_keys:
+        base, size, _ = split_wb_sales_key(key)
+        if size != "единый":
+            sized_bases.add(base)
+
+    if not sized_bases:
+        return
+
+    for key in list(all_keys):
+        base, size, barcode = split_wb_sales_key(key)
+        # Удаляем только "чистый" базовый ключ без суффикса.
+        if key == base and base in sized_bases and size == "единый" and not barcode:
+            orders_data.pop(key, None)
+            purchases_data.pop(key, None)
+            cancels_data.pop(key, None)
+            income_data.pop(key, None)
+            art_original_case.pop(key, None)
+
+
 def extract_period_from_filename(filename):
     """
     Извлекает период из имени файла WB.
@@ -664,6 +747,10 @@ def process_wb_sales_file(file_path):
     income_data = {}
     art_original_case = {}  # Сохраняем оригинальный регистр
 
+    # Необязательные колонки (если есть в выгрузке WB, используем для разделения по размерам/баркодам).
+    barcode_col = next((c for c in ('Баркод', 'Штрихкод', 'Баркод товара') if c in df.columns), None)
+    size_col = next((c for c in ('Размер', 'Размер на бирке', 'Тех. размер', 'Техразмер') if c in df.columns), None)
+
     for _, row in df.iterrows():
         # Получаем артикул
         art_raw = row.get('Артикул продавца')
@@ -671,14 +758,16 @@ def process_wb_sales_file(file_path):
             continue
 
         art_original = str(art_raw).strip()
-        art = art_original.lower()
+        size_raw = row.get(size_col) if size_col else None
+        barcode_raw = row.get(barcode_col) if barcode_col else None
+        art, art_display = build_wb_sales_key(art_original, size_raw, barcode_raw)
 
         if not art or art == 'nan':
             continue
 
         # Сохраняем оригинальный регистр (при первой встрече)
         if art not in art_original_case:
-            art_original_case[art] = art_original
+            art_original_case[art] = art_display
 
         # Получаем значения
         ordered = row.get('шт.', 0)
@@ -703,6 +792,14 @@ def process_wb_sales_file(file_path):
         cancels = orders_data[art] - purchases_data.get(art, 0)
         cancels_data[art] = max(0, cancels)
 
+    drop_unified_base_sales_keys(
+        orders_data=orders_data,
+        purchases_data=purchases_data,
+        cancels_data=cancels_data,
+        income_data=income_data,
+        art_original_case=art_original_case,
+    )
+
     logger.info(f"Обработано {len(purchases_data)} артикулов из файла")
 
     return orders_data, purchases_data, cancels_data, income_data, art_original_case
@@ -720,10 +817,14 @@ def group_wb_sales_data(orders_data, purchases_data, cancels_data, income_data,
     """
     # Создаём обратный маппинг: артикул -> template_id
     art_to_template_id = {}
+    barcode_to_template_id = {}
     for template_id, arts in template_id_to_cabinet_arts.items():
         for art in arts:
             art_lower = art.strip().lower()
             art_to_template_id[art_lower] = template_id
+            bc = normalize_barcode(art)
+            if bc:
+                barcode_to_template_id[bc] = template_id
 
     grouped = {}
     unmatched = {}
@@ -757,7 +858,10 @@ def group_wb_sales_data(orders_data, purchases_data, cancels_data, income_data,
         })
 
         # Ищем соответствие в шаблоне
-        template_id = art_to_template_id.get(art)
+        base_art, _, barcode = split_wb_sales_key(art)
+        template_id = art_to_template_id.get(base_art)
+        if template_id is None and barcode:
+            template_id = barcode_to_template_id.get(barcode)
 
         if template_id is not None:
             # Артикул найден в шаблоне
@@ -806,10 +910,14 @@ def group_wb_sales_data_v2(orders_data, purchases_data, cancels_data, income_dat
     """
     # Создаём обратный маппинг: артикул -> template_id
     art_to_template_id = {}
+    barcode_to_template_id = {}
     for template_id, arts in template_id_to_cabinet_arts.items():
         for art in arts:
             art_lower = art.strip().lower()
             art_to_template_id[art_lower] = template_id
+            bc = normalize_barcode(art)
+            if bc:
+                barcode_to_template_id[bc] = template_id
 
     grouped = {}
     unmatched = {}
@@ -823,8 +931,9 @@ def group_wb_sales_data_v2(orders_data, purchases_data, cancels_data, income_dat
         purchases = purchases_data.get(art, 0)
         cancels = cancels_data.get(art, 0)
         income = income_data.get(art, 0)
-        payout = total_payout_data.get(art, 0)
-        exp = expenses_data.get(art, {})
+        base_art, _, barcode = split_wb_sales_key(art)
+        payout = total_payout_data.get(art, total_payout_data.get(base_art, 0))
+        exp = expenses_data.get(art) or expenses_data.get(base_art, {})
 
         # Добавляем в raw_art_data для листа "Исходные артикулы"
         total_shipments = purchases + cancels
@@ -853,7 +962,9 @@ def group_wb_sales_data_v2(orders_data, purchases_data, cancels_data, income_dat
         })
 
         # Ищем соответствие в шаблоне
-        template_id = art_to_template_id.get(art)
+        template_id = art_to_template_id.get(base_art)
+        if template_id is None and barcode:
+            template_id = barcode_to_template_id.get(barcode)
 
         if template_id is not None:
             # Артикул найден в шаблоне

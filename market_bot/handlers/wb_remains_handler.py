@@ -2,6 +2,7 @@
 
 import sys
 import os
+import re
 import pandas as pd
 import logging
 import time
@@ -31,7 +32,7 @@ from states import WB_REMAINS_CABINET_CHOICE  # ← ДОЛЖЕН БЫТЬ В sta
 from utils.template_loader import get_cabinet_articles_by_template_id
 from utils.stock_control import resolve_stock_thresholds, apply_fill_to_cells
 
-# Content API endpoints
+# Эндпоинты Content API
 WB_CONTENT_BASE_URL = "https://content-api.wildberries.ru"
 
 
@@ -49,19 +50,51 @@ def clean_article(article):
 
 
 def normalize_wb_size(value) -> str:
-    """Нормализует размер WB для отчётов.
-
-    Требование: если размера нет (0) или ONE — писать "единый".
-    """
+    """Нормализует размер WB в `NNN-NNN` или `единый`."""
+    unified = "единый"
     if value is None:
-        return "единый"
+        return unified
     s = str(value).strip()
     if not s:
-        return "единый"
+        return unified
     s_up = s.upper()
     if s_up in {"0", "ONE", "ONE SIZE", "ONESIZE", "ЕДИНЫЙ", "ЕДИНЫЙ РАЗМЕР"}:
-        return "единый"
+        return unified
+    src = s.replace("\\", "/")
+    m = re.search(r"(\d{2,3})\s*[-/]\s*(\d{2,3})", src)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
     return s
+
+
+def drop_unified_rows_if_sized_exists(rows: dict[str, dict]) -> dict[str, dict]:
+    """Удаляет строки с размером `единый`, если у артикула есть конкретные размеры."""
+    sized_articles: set[str] = set()
+    for item in rows.values():
+        if not isinstance(item, dict):
+            continue
+        art = clean_article(item.get("article"))
+        size = normalize_wb_size(item.get("size"))
+        is_unified = not size or size == "единый"
+        if art and not is_unified:
+            sized_articles.add(art)
+
+    if not sized_articles:
+        return rows
+
+    filtered: dict[str, dict] = {}
+    for key, item in rows.items():
+        if not isinstance(item, dict):
+            filtered[key] = item
+            continue
+        art = clean_article(item.get("article"))
+        size = normalize_wb_size(item.get("size"))
+        is_unified = not size or size == "единый"
+        if art in sized_articles and is_unified:
+            continue
+        filtered[key] = item
+    return filtered
+
 
 
 class WildberriesAPI:
@@ -244,7 +277,7 @@ class WildberriesAPI:
         return all_cards
 
     def build_vendor_code_index(self, cards: list[dict]) -> dict[str, dict]:
-        """Индекс по vendorCode для быстрого ��оиска карточки."""
+        """ндекс по vendorCode для быстрого ��оиска карточки."""
         idx: dict[str, dict] = {}
         for c in cards or []:
             if not isinstance(c, dict):
@@ -257,7 +290,7 @@ class WildberriesAPI:
     def get_cards_by_vendor_codes(self, vendor_codes: list[str]) -> list[dict]:
         """Получает карточки по vendorCode.
 
-        Используем /content/v2/get/cards/list. Возвращает список карточек.
+        спользуем /content/v2/get/cards/list. Возвращает список карточек.
         """
         vendor_codes = [str(x).strip() for x in (vendor_codes or []) if str(x).strip()]
         if not vendor_codes:
@@ -303,12 +336,12 @@ class WildberriesAPI:
         if not all_cards:
             logger.debug(
                 f"WB content-api get/cards/list: итого 0 карточек по {len(vendor_codes)} vendorCodes. "
-                f"Пробую fallback: загрузить все карточки и сматчить vendorCodes локально..."
+                f"Пробую запасной сценарий: загрузить все карточки и сопоставить vendorCodes локально..."
             )
             all_seller_cards = self.get_all_cards(limit=50)
             if not all_seller_cards:
                 logger.warning(
-                    "WB content-api fallback get_all_cards: 0 карточек. "
+                    "WB content-api запасной сценарий get_all_cards: 0 карточек. "
                     "Похоже, токен не имеет доступа к карточкам (content-api) или у кабинета нет карточек."
                 )
                 return []
@@ -321,7 +354,7 @@ class WildberriesAPI:
                     matched.append(c)
 
             logger.debug(
-                f"WB content-api fallback get_all_cards: всего карточек={len(all_seller_cards)}, "
+                f"WB content-api запасной сценарий get_all_cards: всего карточек={len(all_seller_cards)}, "
                 f"совпадений по vendorCodes={len(matched)}"
             )
             return matched
@@ -334,52 +367,51 @@ class WildberriesAPI:
         return (data or {}).get("data") or []
 
     def get_fbo_stocks_v1(self):
-        """Получает ВСЕ FBO-остатки через statistics-api"""
+        """Fetch all FBO stocks via statistics-api."""
         all_stocks = []
         last_change_date = "2010-01-01T00:00:00"
 
         while True:
-            # 🔥 ИСПРАВЛЕНО: удалены лишние пробелы в конце URL!
             url = "https://statistics-api.wildberries.ru/api/v1/supplier/stocks"
             params = {"dateFrom": last_change_date}
 
             try:
                 response = requests.get(url, headers=self.headers, params=params, timeout=10)
                 response.raise_for_status()
-                logger.info(f"Запрос FBO остатков v1, статус={response.status_code}, dateFrom={last_change_date}")
+                logger.info(
+                    f"Запрос FBO остатков v1: статус={response.status_code}, dateFrom={last_change_date}"
+                )
 
-                if response.status_code == 200:
-                    data = response.json()
-                    if not isinstance(data, list):
-                        logger.error(f"Некорректный ответ (не список): {data}")
-                        break
-
-                    if not data:
-                        logger.info("Получен пустой ответ — выгрузка завершена")
-                        break
-
-                    all_stocks.extend(data)
-                    logger.info(f"Получено {len(data)} строк, всего: {len(all_stocks)}")
-
-                    last_change_date = data[-1].get("lastChangeDate")
-                    if not last_change_date:
-                        break
-
-                    time.sleep(1)
-                else:
-                    logger.error(f"Ошибка v1 stocks: {response.status_code} - {response.text}")
+                if response.status_code != 200:
+                    logger.error(f"v1 stocks error: {response.status_code} - {response.text}")
                     break
+
+                data = response.json()
+                if not isinstance(data, list):
+                    logger.error(f"Invalid response (not a list): {data}")
+                    break
+
+                if not data:
+                    logger.info("Получен пустой ответ, выгрузка завершена")
+                    break
+
+                all_stocks.extend(data)
+                logger.info(f"Получено {len(data)} строк, всего: {len(all_stocks)}")
+
+                last_change_date = data[-1].get("lastChangeDate")
+                if not last_change_date:
+                    break
+
+                time.sleep(1)
 
             except requests.exceptions.Timeout:
                 logger.error(f"Таймаут при запросе FBO остатков (dateFrom={last_change_date})")
                 break
             except requests.exceptions.RequestException as e:
-                logger.error(f"Ошибка сети при запросе FBO остатков: {e}")
-                break
-            except Exception as e:
-                logger.error(f"Неожиданная ошибка в v1 stocks: {e}", exc_info=True)
+                logger.error(f"Сетевая ошибка при запросе FBO остатков: {e}")
                 break
 
+        # Не фильтруем quantity > 0: ниже используется логика с нулевыми остатками.
         return all_stocks
 
     def get_stocks_report(self, nm_ids: list[int], debug_nm_ids: list[int] | None = None) -> list[dict]:
@@ -681,7 +713,7 @@ class WildberriesAPI:
 
     @staticmethod
     def extract_composition_from_card_api(payload: dict) -> str | None:
-        """Извлекает состав из ответа card.wb.ru.
+        """звлекает состав из ответа card.wb.ru.
 
         Обычно данные лежат в data.products[0].properties / options / характеристиках.
         """
@@ -743,7 +775,7 @@ class WildberriesAPI:
 
     @staticmethod
     def extract_color_from_content_card(card: dict) -> str | None:
-        """Извлекает цвет из карточки content-api (/content/v2/get/cards/list).
+        """звлекает цвет из карточки content-api (/content/v2/get/cards/list).
 
         Ожидаем, что цвет лежит в списке characteristics как характеристика,
         у которой name содержит 'цвет'.
@@ -872,33 +904,35 @@ def normalize_art(art_str):
     return s
 
 
+
+
+def normalize_barcode(value) -> str:
+    if value is None:
+        return ""
+    return "".join(ch for ch in str(value) if ch.isdigit())
+
 def group_wb_remains_data(stock_data, template_id_to_cabinet_arts, template_id_to_name):
-    """
-    Группирует данные остатков WB по шаблонным артикулам.
-
-    :param stock_data: dict {article: {"in_stock": ..., "in_way_from_client": ..., "in_way_to_client": ...}}
-    :param template_id_to_cabinet_arts: dict {template_id: [cabinet_art1, cabinet_art2, ...]}
-    :param template_id_to_name: dict {template_id: "Шаблонное название"}
-    :return: grouped (по template_id), unmatched (артикулы без привязки)
-    """
-    stock_data_clean = {}
-    for art, data in stock_data.items():
-        clean_art = normalize_art(art)
-        if clean_art:
-            stock_data_clean[clean_art] = data
-
+    """Group WB remains by template id using article or barcode mapping."""
     cabinet_art_to_template_id = {}
+    cabinet_barcode_to_template_id = {}
     for template_id, arts in template_id_to_cabinet_arts.items():
         for art in arts:
             clean_art = normalize_art(art)
             if clean_art:
                 cabinet_art_to_template_id[clean_art] = template_id
+            clean_barcode = normalize_barcode(art)
+            if clean_barcode:
+                cabinet_barcode_to_template_id[clean_barcode] = template_id
 
     grouped = {}
     unmatched = {}
 
-    for clean_art, data in stock_data_clean.items():
+    for stock_key, data in stock_data.items():
+        clean_art = normalize_art(data.get('article') or stock_key)
+        clean_barcode = normalize_barcode(data.get('barcode'))
         template_id = cabinet_art_to_template_id.get(clean_art)
+        if template_id is None and clean_barcode:
+            template_id = cabinet_barcode_to_template_id.get(clean_barcode)
 
         if template_id is not None:
             if template_id not in grouped:
@@ -912,19 +946,21 @@ def group_wb_remains_data(stock_data, template_id_to_cabinet_arts, template_id_t
             grouped[template_id]['in_way_from_client'] += data['in_way_from_client']
             grouped[template_id]['in_way_to_client'] += data['in_way_to_client']
         else:
-            unmatched[clean_art] = {
-                'name': f"НЕОПОЗНАННЫЙ: {clean_art}",
-                'in_stock': data['in_stock'],
-                'in_way_from_client': data['in_way_from_client'],
-                'in_way_to_client': data['in_way_to_client']
-            }
+            unmatched_key = clean_art
+            if clean_barcode:
+                unmatched_key = f"{clean_art} | barcode:{clean_barcode}"
+            if unmatched_key not in unmatched:
+                unmatched[unmatched_key] = {
+                    'name': f"UNMATCHED: {unmatched_key}",
+                    'in_stock': 0,
+                    'in_way_from_client': 0,
+                    'in_way_to_client': 0
+                }
+            unmatched[unmatched_key]['in_stock'] += data['in_stock']
+            unmatched[unmatched_key]['in_way_from_client'] += data['in_way_from_client']
+            unmatched[unmatched_key]['in_way_to_client'] += data['in_way_to_client']
 
     return grouped, unmatched
-
-
-# ======================
-# Обработчики
-# ======================
 
 async def start_wb_remains(update: Update, context: CallbackContext) -> int:
     """Начало — выбор кабинета Wildberries"""
@@ -989,7 +1025,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         context.user_data['wb_remains_loading_msg2_id'] = loading_msg2.message_id
         stocks = wb_api.get_fbo_stocks_v1()
 
-        # --- FIX: WB statistics-api может не вернуть товары с 0 остатками.
+        # WB statistics-api может не вернуть товары с 0 остатками.
         # Подмешиваем список всех карточек продавца из content-api и добавляем отсутствующие
         # vendorCode как "0 остатки", чтобы выгружались АБСОЛЮТНО все артикулы.
         try:
@@ -1061,9 +1097,9 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         # === 1. Сырые данные ===
         raw_data = []
         stock_dict = {}
+        row_stock_dict: dict[str, dict] = {}
         category_by_article = {}
 
-        size_by_article: dict[str, str] = {}
         color_by_article: dict[str, str] = {}
         # Собираем vendor_code(=supplierArticle) список для content-api
 
@@ -1083,8 +1119,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
 
             # Размер чаще всего в stocks.techSize
             tech_size = item.get("techSize")
-            if tech_size is not None and str(tech_size).strip():
-                size_by_article[article] = normalize_wb_size(tech_size)
+            size_value = normalize_wb_size(tech_size)
 
             # Иногда WB отдаёт цвет прямо в stocks
             for ck in ("color", "Color", "цвет", "Цвет"):
@@ -1104,11 +1139,30 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                     'in_way_from_client': 0
                 }
 
-            stock_dict[article]['in_stock'] += item.get('quantity', 0)
-            stock_dict[article]['in_way_to_client'] += item.get('inWayToClient', 0)
-            stock_dict[article]['in_way_from_client'] += item.get('inWayFromClient', 0)
+            q = item.get('quantity', 0) or 0
+            in_to = item.get('inWayToClient', 0) or 0
+            in_from = item.get('inWayFromClient', 0) or 0
 
-        # --- FIX: категория для 0-остатков (добавленных из content-api) ---
+            stock_dict[article]['in_stock'] += q
+            stock_dict[article]['in_way_to_client'] += in_to
+            stock_dict[article]['in_way_from_client'] += in_from
+
+            barcode = normalize_barcode(item.get("barcode"))
+            row_key = f"{article}__{barcode}" if barcode else f"{article}__size_{size_value}"
+            if row_key not in row_stock_dict:
+                row_stock_dict[row_key] = {
+                    'article': article,
+                    'size': size_value,
+                    'barcode': barcode,
+                    'in_stock': 0,
+                    'in_way_to_client': 0,
+                    'in_way_from_client': 0
+                }
+            row_stock_dict[row_key]['in_stock'] += q
+            row_stock_dict[row_key]['in_way_to_client'] += in_to
+            row_stock_dict[row_key]['in_way_from_client'] += in_from
+
+        # Категория для 0-остатков (добавленных из content-api).
         # В statistics-api у таких строк обычно нет subject/category, поэтому подставляем из карточек content-api.
         try:
             cards_index: dict[str, dict] = {}
@@ -1142,9 +1196,59 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
 
             if filled:
                 logger.debug(f"WB: категория из content-api проставлена для {filled} артикулов (включая 0-остатки)")
+
+
+            existing_article_size_keys = {
+                f"{d.get('article')}__{d.get('size') or 'единый'}"
+                for d in row_stock_dict.values()
+                if isinstance(d, dict)
+            }
+
+            #     (  )   WB.
+            for art in list(stock_dict.keys()):
+                card = cards_index.get(art)
+                if not isinstance(card, dict):
+                    continue
+
+                sizes = card.get("sizes") or []
+                if not isinstance(sizes, list):
+                    continue
+
+                for sz in sizes:
+                    if not isinstance(sz, dict):
+                        continue
+
+                    size_value = normalize_wb_size(sz.get("techSize") or sz.get("wbSize") or card.get("techSize"))
+                    article_size_key = f"{art}__{size_value}"
+                    if article_size_key in existing_article_size_keys:
+                        continue
+                    barcode = ""
+                    for key in ("skus", "barcodes"):
+                        vals = sz.get(key)
+                        if isinstance(vals, list):
+                            for v in vals:
+                                bc = normalize_barcode(v)
+                                if bc:
+                                    barcode = bc
+                                    break
+                        if barcode:
+                            break
+
+                    row_key = f"{art}__{barcode}" if barcode else f"{art}__size_{size_value}"
+                    if row_key not in row_stock_dict:
+                        row_stock_dict[row_key] = {
+                            'article': art,
+                            'size': size_value,
+                            'barcode': barcode,
+                            'in_stock': 0,
+                            'in_way_to_client': 0,
+                            'in_way_from_client': 0
+                        }
+                        existing_article_size_keys.add(article_size_key)
         except Exception as e:
             logger.warning(f"WB: не удалось заполнить категорию из content-api: {e}")
 
+        row_stock_dict = drop_unified_rows_if_sized_exists(row_stock_dict)
         # === 1.1. Состав материала через nmId (card API) ===
         # Кеши в рамках одного запуска
         charcs_cache: dict[int, list[dict]] = {}
@@ -1297,14 +1401,14 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                 return value
             return 999.0 if num > 999 else round(num, 2)
 
-        for article, counts in stock_dict.items():
-            total = (
-                    counts['in_stock'] +
-                    counts['in_way_to_client'] +
-                    counts['in_way_from_client']
-            )
+        for row in row_stock_dict.values():
+            article = row['article']
+            size_value = row.get('size') or 'единый'
+            display_article = article if size_value == 'единый' else f"{article} {size_value}"
+            total = row['in_stock'] + row['in_way_to_client'] + row['in_way_from_client']
 
-            # Получаем данные об оборачиваемости по nmId этого артикула
+            # Оборачиваемость на WB доступна по nmId артикула,
+            # поэтому используем ее для размерной строки этого артикула.
             nm_id = nm_id_by_article.get(article)
             analytics = analytics_by_nm_id.get(nm_id, {}) if nm_id else {}
 
@@ -1313,11 +1417,11 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
 
             raw_data.append({
                 'Категория': category_by_article.get(article, '—'),
-                'Артикул': article,
-                'Доступно на складах': counts['in_stock'],
-                'Возвращаются от покупателей': counts['in_way_from_client'],
-                'В пути до покупателей': counts['in_way_to_client'],
-                'Итого на МП': total,
+                'Артикул': display_article,
+                'Доступно на складах': row['in_stock'],
+                'Возвращаются от покупателей': row['in_way_from_client'],
+                'В пути до покупателей': row['in_way_to_client'],
+                'того на МП': total,
                 'Оборачиваемость текущих остатков': sale_rate,
                 'Оборачиваемость средних остатков': avg_turnover,
                 'Среднее кол-во заказов в день': analytics.get('avgOrders', '')
@@ -1326,7 +1430,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
         df_raw = pd.DataFrame(raw_data).sort_values(by='Артикул').reset_index(drop=True)
         headers_raw = [
             "Категория", "Артикул", "Доступно на складах", "Возвращаются от покупателей",
-            "В пути до покупателей", "Итого на МП", "Оборачиваемость текущих остатков",
+            "В пути до покупателей", "того на МП", "Оборачиваемость текущих остатков",
             "Оборачиваемость средних остатков", "Среднее кол-во заказов в день"
         ]
 
@@ -1360,12 +1464,27 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                 template_rows_to_color.append(idx)
 
         wb_stock_data = {}
-        for art, counts in stock_dict.items():
-            wb_stock_data[art] = {
-                "in_stock": counts['in_stock'],
-                "in_way_from_client": counts['in_way_from_client'],
-                "in_way_to_client": counts['in_way_to_client']
-            }
+        for idx, item in enumerate(stocks or []):
+            article = clean_article(item.get("supplierArticle"))
+            if not article:
+                continue
+            barcode = normalize_barcode(item.get("barcode"))
+            size_value = normalize_wb_size(item.get("techSize"))
+            key = f"{article}__{barcode}" if barcode else f"{article}__size_{size_value}"
+            if key not in wb_stock_data:
+                wb_stock_data[key] = {
+                    "article": article,
+                    "size": size_value,
+                    "barcode": barcode,
+                    "in_stock": 0,
+                    "in_way_from_client": 0,
+                    "in_way_to_client": 0
+                }
+            wb_stock_data[key]["in_stock"] += item.get("quantity", 0) or 0
+            wb_stock_data[key]["in_way_from_client"] += item.get("inWayFromClient", 0) or 0
+            wb_stock_data[key]["in_way_to_client"] += item.get("inWayToClient", 0) or 0
+
+        wb_stock_data = drop_unified_rows_if_sized_exists(wb_stock_data)
 
         grouped, unmatched = group_wb_remains_data(wb_stock_data, template_id_to_cabinet_arts, template_id_to_name)
 
@@ -1379,7 +1498,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                     'Доступно на складах': d['in_stock'],
                     'Возвращаются от покупателей': d['in_way_from_client'],
                     'В пути до покупателей': d['in_way_to_client'],
-                    'Итого на МП': total
+                    'того на МП': total
                 })
             else:
                 name = template_id_to_name.get(id_val, f"ID {id_val}")
@@ -1388,7 +1507,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                     'Доступно на складах': 0,
                     'Возвращаются от покупателей': 0,
                     'В пути до покупателей': 0,
-                    'Итого на МП': 0
+                    'того на МП': 0
                 })
 
         for art, d in unmatched.items():
@@ -1398,11 +1517,11 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
                 'Доступно на складах': d['in_stock'],
                 'Возвращаются от покупателей': d['in_way_from_client'],
                 'В пути до покупателей': d['in_way_to_client'],
-                'Итого на МП': total
+                'того на МП': total
             })
 
         df_template = pd.DataFrame(template_data)
-        headers_template = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей", "Итого на МП"]
+        headers_template = ["Артикул", "Доступно на складах", "Возвращаются от покупателей", "В пути до покупателей", "того на МП"]
 
         thresholds = resolve_stock_thresholds(context, query.message.chat_id)
         raw_rows_to_color = []
@@ -1425,7 +1544,7 @@ async def handle_wb_cabinet_choice(update: Update, context: CallbackContext) -> 
             f"📦 <b>Доступно на складах:</b> {fmt_num(total_in_stock)} шт\n"
             f"↩️ <b>Возвращаются от покупателей:</b> {fmt_num(total_in_way_from)} шт\n"
             f"🚚 <b>В пути до покупателей:</b> {fmt_num(total_in_way_to)} шт\n"
-            f"✅ <b>Итого на МП:</b> {fmt_num(total_mp)} шт"
+            f"✅ <b>того на МП:</b> {fmt_num(total_mp)} шт"
         )
 
         # === Создаём Excel с двумя листами ===
@@ -1513,7 +1632,7 @@ def create_excel_with_two_sheets(
     ws2 = wb.create_sheet(title="Остатки исходные артикулы")
     _write_sheet(ws2, df_raw, headers_raw, has_name=False)
     if raw_rows_to_color and thresholds:
-        total_col = headers_raw.index("Итого на МП") + 1
+        total_col = headers_raw.index("того на МП") + 1
         apply_fill_to_cells(ws2, raw_rows_to_color, [total_col], thresholds)
 
     wb.save(filename)

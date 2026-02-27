@@ -81,7 +81,7 @@ async def _send_long_text(update: Update, text: str, filename: str | None = None
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return
         except Exception:
-            # fallback: шлём кусками
+            # запасной вариант: шлём кусками
             pass
 
     for i, p in enumerate(parts, start=1):
@@ -449,7 +449,7 @@ def _ozon_extract_offer_id_to_attrs(cabinet_id: int) -> dict[str, dict]:
     offer_id_to_dcid: dict[str, int] = {}
     offer_id_to_type_id: dict[str, int] = {}
 
-    # NOTE: используем локальный чанкер, чтобы не зависеть от import из ozon_remains_handler
+    # Используем локальный чанкер, чтобы не зависеть от импорта из ozon_remains_handler.
     for chunk in _chunk_list(offer_ids, 1000):
         resp = ozon.get_product_info_list(offer_ids=chunk)
         its = []
@@ -645,7 +645,7 @@ def _ozon_extract_offer_id_to_attrs(cabinet_id: int) -> dict[str, dict]:
             if dcid and tpid:
                 cat = type_name_by_pair.get((int(dcid), int(tpid))) or cat
             if cat == '—':
-                # fallback: иногда dcid можно распарсить тут
+                # запасной вариант: иногда dcid можно распарсить здесь
                 try:
                     dcid2 = info_item.get('description_category_id')
                     tpid2 = info_item.get('type_id')
@@ -778,7 +778,7 @@ def _wb_extract_composition_from_card_api_by_charc_id(payload: dict, charc_id: i
             except Exception:
                 continue
 
-    # fallback: characteristics
+    # запасной вариант: characteristics
     for key in ('characteristics', 'Characteristics'):
         for cid, nm, val in _iter_name_value_id(p0.get(key) or []):
             try:
@@ -812,7 +812,7 @@ def _wb_extract_composition_from_card_api_by_charc_id(payload: dict, charc_id: i
 def _wb_get_cards_by_vendor_codes_fuzzy(cabinet_id: int, vendor_codes: list[str]) -> list[dict]:
     """Пытаемся получить карточки WB через content-api по vendorCodes, даже если нет остатков."""
     wb = WildberriesAPI(cabinet_id=cabinet_id)
-    # метод get_cards_by_vendor_codes уже есть в wb_remains_handler и содержит часть fallback-логики
+    # Метод get_cards_by_vendor_codes уже есть в wb_remains_handler и содержит часть запасной логики.
     try:
         cards = wb.get_cards_by_vendor_codes(vendor_codes)
         if cards:
@@ -820,7 +820,7 @@ def _wb_get_cards_by_vendor_codes_fuzzy(cabinet_id: int, vendor_codes: list[str]
     except Exception:
         cards = []
 
-    # fallback: textSearch по нескольким запросам (контент API иногда не ищет по vendorCodes)
+    # запасной вариант: textSearch по нескольким запросам (контент API иногда не ищет по vendorCodes)
     found: list[dict] = []
     try:
         for q in vendor_codes[:20]:
@@ -850,56 +850,166 @@ def _wb_get_cards_by_vendor_codes_fuzzy(cabinet_id: int, vendor_codes: list[str]
 
 
 def _wb_extract_attrs_for_articles(cabinet_id: int, stocks_raw_items: list[dict], needed_articles: set[str] | None = None) -> dict[str, dict]:
-    """WB supplierArticle -> {category,color,size,composition,barcode}.
-
-    Если needed_articles задан, то для артикулов, которых нет в stocks_raw_items (обычно 0 остатков),
-    дополнительно подтянем карточки через content-api по vendorCode.
-    """
+    """WB article key -> {category, color, size, composition, barcode}."""
     wb = WildberriesAPI(cabinet_id=cabinet_id)
+    single_size = normalize_wb_size(None)
+    na = "-"
+
+    def _size_key(v) -> str:
+        s = normalize_wb_size(v)
+        if s == single_size:
+            return s
+        src = str(v if v is not None else s).replace("\\", "/")
+        m = re.search(r"(\d{2,3})\s*[-/]\s*(\d{2,3})", src)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}"
+        return s
+
+    def _infer_color_from_article(a: str) -> str:
+        low = _normalize_key_fuzzy(a)
+        color_map = {
+            "\u0431\u0435\u043b": "\u0431\u0435\u043b\u044b\u0439",
+            "\u0433\u043e\u043b\u0443\u0431": "\u0433\u043e\u043b\u0443\u0431\u043e\u0439",
+            "\u0440\u043e\u0437\u043e\u0432": "\u0440\u043e\u0437\u043e\u0432\u044b\u0439",
+            "\u0447\u0435\u0440\u043d": "\u0447\u0435\u0440\u043d\u044b\u0439",
+            "\u0441\u0438\u043d": "\u0441\u0438\u043d\u0438\u0439",
+            "\u0437\u0435\u043b": "\u0437\u0435\u043b\u0435\u043d\u044b\u0439",
+            "\u043a\u0440\u0430\u0441": "\u043a\u0440\u0430\u0441\u043d\u044b\u0439",
+            "\u0431\u0435\u0436": "\u0431\u0435\u0436\u0435\u0432\u044b\u0439",
+            "\u0441\u0435\u0440": "\u0441\u0435\u0440\u044b\u0439",
+        }
+        for token, color_name in color_map.items():
+            if token in low:
+                return color_name
+        return na
 
     nm_ids: list[int] = []
     nm_id_by_article: dict[str, int] = {}
     stock_barcode_by_article: dict[str, str] = {}
     category_by_article: dict[str, str] = {}
     size_by_article: dict[str, str] = {}
-
+    base_by_article: dict[str, str] = {}
+    barcode_by_base_size: dict[tuple[str, str], str] = {}
     all_articles: set[str] = set()
+
     for it in stocks_raw_items or []:
-        art = clean_article(it.get('supplierArticle'))
-        if not art:
+        raw_art = clean_article(it.get('supplierArticle'))
+        if not raw_art:
             continue
-        all_articles.add(art)
+
+        # В некоторых кабинетах supplierArticle уже приходит с размером
+        # (например, "... 112-134 см"). Разделяем на базу + размер и нормализуем.
+        parsed_base, parsed_size = _split_wb_article_and_size(raw_art)
+        base_art = parsed_base if parsed_size != single_size else raw_art
+
+        size_val = _size_key(it.get('techSize'))
+        if size_val == single_size and parsed_size != single_size:
+            size_val = _size_key(parsed_size)
+
+        full_art = base_art if size_val == single_size else f"{base_art} {size_val}"
+
+        all_articles.add(base_art)
+        all_articles.add(full_art)
+        all_articles.add(raw_art)
+        base_by_article[base_art] = base_art
+        base_by_article[full_art] = base_art
+        base_by_article[raw_art] = base_art
+        size_by_article[base_art] = size_val
+        size_by_article[full_art] = size_val
+        size_by_article[raw_art] = size_val
+
         nm = it.get('nmId') or it.get('nmID')
         try:
             if nm is not None:
                 nm_i = int(nm)
                 if nm_i > 0:
                     nm_ids.append(nm_i)
-                    nm_id_by_article[art] = nm_i
+                    nm_id_by_article[base_art] = nm_i
+                    nm_id_by_article[full_art] = nm_i
+                    nm_id_by_article[raw_art] = nm_i
         except Exception:
             pass
+
         bc = it.get('barcode')
         if bc is not None and str(bc).strip():
-            stock_barcode_by_article[art] = str(bc).strip()
+            bc_str = str(bc).strip()
+            stock_barcode_by_article[full_art] = bc_str
+            stock_barcode_by_article.setdefault(base_art, bc_str)
+            stock_barcode_by_article.setdefault(raw_art, bc_str)
+            barcode_by_base_size[(base_art, size_val)] = bc_str
+
         cat = it.get('subject') or it.get('category')
         if cat is not None and str(cat).strip():
-            category_by_article[art] = str(cat).strip()
-        ts = it.get('techSize')
-        if ts is not None and str(ts).strip():
-            size_by_article[art] = normalize_wb_size(ts)
+            cat_str = str(cat).strip()
+            category_by_article[full_art] = cat_str
+            category_by_article.setdefault(base_art, cat_str)
+            category_by_article.setdefault(raw_art, cat_str)
 
-    # Добавляем артикулы из needed_articles, чтобы гарантировать attrs даже при 0 остатках
+    known_articles = set(all_articles)
     missing_needed: list[str] = []
+    needed_alias_to_base: dict[str, str] = {}
+    needed_alias_size: dict[str, str] = {}
     if needed_articles:
-        for a in needed_articles:
-            a = clean_article(a)
+        for a0 in needed_articles:
+            a = clean_article(a0)
             if not a:
                 continue
-            if a not in all_articles:
-                missing_needed.append(a)
-            all_articles.add(a)
 
-    # Подтянем карточки по vendorCode для отсутствующих в stocks
+            base, explicit_size = _split_wb_article_and_size(a)
+            explicit_size = _size_key(explicit_size)
+            if explicit_size == single_size:
+                explicit_size = ''
+
+            resolved = None
+            need_base_norm = _normalize_wb_base_for_match(base or a)
+            ranked: list[tuple[int, str]] = []
+            for cand in known_articles:
+                c_base, c_size = _split_wb_article_and_size(cand)
+                if _normalize_wb_base_for_match(c_base) != need_base_norm:
+                    continue
+                score = 0
+                if explicit_size:
+                    if c_size == explicit_size:
+                        score = 3
+                    elif c_size == single_size:
+                        score = 1
+                else:
+                    score = 2
+                if score > 0:
+                    ranked.append((score, cand))
+            if ranked:
+                ranked.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
+                chosen = ranked[0][1]
+                resolved = base_by_article.get(chosen, chosen)
+
+            for probe in (base, a):
+                if resolved:
+                    break
+                if probe in base_by_article and probe in known_articles:
+                    resolved = base_by_article[probe]
+                    break
+                nk_probe = _normalize_key_fuzzy(probe)
+                candidates = [x for x in known_articles if _normalize_key_fuzzy(x) == nk_probe]
+                if not candidates:
+                    candidates = [x for x in known_articles if nk_probe.startswith(_normalize_key_fuzzy(x))]
+                if candidates:
+                    resolved = sorted(candidates, key=len, reverse=True)[0]
+                    break
+            if not resolved:
+                # Сохраняем исходный ключ, если стабильную базу найти не удалось.
+                # Это помогает для WB-карточек, где vendorCode уже содержит суффикс размера/единиц.
+                resolved = a
+            base = resolved
+
+            needed_alias_to_base[a] = base
+            if explicit_size:
+                needed_alias_size[a] = explicit_size
+
+            if base not in known_articles and base not in missing_needed:
+                missing_needed.append(base)
+            all_articles.add(a)
+            all_articles.add(base)
+
     cards_by_vendor: dict[str, dict] = {}
     if missing_needed:
         cards = _wb_get_cards_by_vendor_codes_fuzzy(cabinet_id, missing_needed)
@@ -907,7 +1017,6 @@ def _wb_extract_attrs_for_articles(cabinet_id: int, stocks_raw_items: list[dict]
             vc = str(c.get('vendorCode') or '').strip()
             if vc:
                 cards_by_vendor[vc] = c
-        # часть карточек могут дать nmID
         for vc, c in cards_by_vendor.items():
             try:
                 nm = int(c.get('nmID') or c.get('nmId'))
@@ -918,31 +1027,77 @@ def _wb_extract_attrs_for_articles(cabinet_id: int, stocks_raw_items: list[dict]
                 nm_ids.append(nm)
 
     nm_ids = list(dict.fromkeys(nm_ids))
-
     by_nm, by_vendor_from_nm = _wb_build_card_indexes(cabinet_id, nm_ids)
-    # дополняем индекс vendorCode карточками, найденными напрямую
     by_vendor = dict(by_vendor_from_nm)
     by_vendor.update(cards_by_vendor)
+    by_vendor_norm: dict[str, dict] = {}
+    by_vendor_size_norm: dict[tuple[str, str], dict] = {}
 
-    # кеши на время выполнения, чтобы не бомбить object/charcs
+    def _upsert_vendor_indexes(vc: str, card: dict) -> None:
+        if not isinstance(card, dict):
+            return
+        vc_base, _vc_size = _split_wb_article_and_size(vc)
+        for probe in {vc, vc_base}:
+            nk = _normalize_wb_base_for_match(probe)
+            if nk and nk not in by_vendor_norm:
+                by_vendor_norm[nk] = card
+        base_norm = _normalize_wb_base_for_match(vc_base or vc)
+        for sz in (card.get('sizes') or []):
+            if not isinstance(sz, dict):
+                continue
+            sz_norm = _size_key(sz.get('techSize') or sz.get('wbSize') or card.get('techSize'))
+            if not sz_norm or sz_norm == single_size:
+                continue
+            key = (base_norm, sz_norm)
+            if key not in by_vendor_size_norm:
+                by_vendor_size_norm[key] = card
+
+    for vc, c in (by_vendor or {}).items():
+        _upsert_vendor_indexes(vc, c)
+
+    # В get_fbo_stocks_v1 этих vendorCode может не быть. В запасном варианте
+    # подтягиваем все карточки из content API.
+    try:
+        all_cards = wb.get_all_cards(limit=50) or []
+        for c in all_cards:
+            if not isinstance(c, dict):
+                continue
+            vc = clean_article(c.get('vendorCode') or c.get('supplierArticle') or '')
+            if not vc:
+                continue
+            by_vendor.setdefault(vc, c)
+            _upsert_vendor_indexes(vc, c)
+    except Exception:
+        pass
     composition_charc_id_by_subject: dict[int, int] = {}
 
     attrs: dict[str, dict] = {}
-    for art in all_articles | category_by_article.keys() | nm_id_by_article.keys() | stock_barcode_by_article.keys() | size_by_article.keys():
-        nm = nm_id_by_article.get(art)
-        card = by_nm.get(nm) if nm else by_vendor.get(art)
+    keys = all_articles | set(category_by_article.keys()) | set(nm_id_by_article.keys()) | set(stock_barcode_by_article.keys()) | set(size_by_article.keys())
+    for art in keys:
+        base_art = base_by_article.get(art, art)
+        nm = nm_id_by_article.get(art) or nm_id_by_article.get(base_art)
+        card = by_nm.get(nm) if nm else (by_vendor.get(base_art) or by_vendor.get(art))
+        if not card:
+            nk = _normalize_wb_base_for_match(base_art)
+            if nk:
+                card = by_vendor_norm.get(nk)
+        if not card:
+            art_base, art_size = _split_wb_article_and_size(art)
+            if art_base and art_size and art_size != single_size:
+                card = by_vendor_size_norm.get((_normalize_wb_base_for_match(art_base), art_size))
 
-        color = '—'
+        color = na
         try:
             cval = wb.extract_color_from_content_card(card) if card else None
             if cval:
                 color = cval
         except Exception:
             pass
+        if color == na:
+            color = _infer_color_from_article(base_art)
 
-        composition = '—'
+        composition = na
         try:
-            # если nm неизвестен, но карточка есть — попробуем взять nm из карточки
             if not nm and isinstance(card, dict):
                 try:
                     nm = int(card.get('nmID') or card.get('nmId'))
@@ -980,51 +1135,79 @@ def _wb_extract_attrs_for_articles(cabinet_id: int, stocks_raw_items: list[dict]
                                     if comp3:
                                         composition = comp3
 
-                        if not composition or composition == '—':
+                        if not composition or composition == na:
                             logger.warning(
-                                f"WB TZ: состав не найден cabinet={cabinet_id} nmId={nm} art={art} "
+                                f"WB TZ: composition not found cabinet={cabinet_id} nmId={nm} art={art} "
                                 f"hasCard={bool(card)} subjectId={subject_id}"
                             )
         except Exception as e:
             logger.warning(f"WB TZ: composition error cabinet={cabinet_id} nmId={nm} art={art} error={e}")
 
-        # категория/размер/баркод: если не было в stocks — пробуем из карточки
-        cat_val = category_by_article.get(art)
-        if (not cat_val or cat_val == '—') and isinstance(card, dict):
-            cat_val = str(card.get('subjectName') or card.get('subject') or card.get('category') or '—').strip() or '—'
+        cat_val = category_by_article.get(art) or category_by_article.get(base_art)
+        if (not cat_val or cat_val == na) and isinstance(card, dict):
+            cat_val = str(card.get('subjectName') or card.get('subject') or card.get('category') or na).strip() or na
 
-        size_val = size_by_article.get(art)
-        if (not size_val or size_val == 'единый') and isinstance(card, dict):
-            # в content-card может быть techSize/variants
+        art_base_for_size, art_size_from_key = _split_wb_article_and_size(art)
+        size_val = size_by_article.get(art) or size_by_article.get(base_art)
+        if art_size_from_key and art_size_from_key != single_size:
+            size_val = art_size_from_key
+        if (not size_val or size_val == single_size) and isinstance(card, dict):
             try:
                 s0 = (card.get('sizes') or [{}])[0]
                 ts = s0.get('techSize') or card.get('techSize')
                 if ts:
-                    size_val = normalize_wb_size(ts)
+                    size_val = _size_key(ts)
             except Exception:
                 pass
 
-        bc_val = stock_barcode_by_article.get(art)
-        if (not bc_val or bc_val == '—') and isinstance(card, dict):
+        bc_val = stock_barcode_by_article.get(art) or stock_barcode_by_article.get(base_art)
+        if (not bc_val or bc_val == na) and isinstance(card, dict):
             try:
-                # иногда баркоды лежат в sizes[].skus/barcodes
-                s0 = (card.get('sizes') or [{}])[0]
-                bcs = s0.get('skus') or s0.get('barcodes') or []
-                if isinstance(bcs, list) and bcs:
-                    bc_val = str(bcs[0]).strip()
+                wanted_size = _size_key(art_size_from_key if art_size_from_key and art_size_from_key != single_size else (size_by_article.get(art) or size_by_article.get(base_art)))
+                chosen_size_obj = None
+                sizes_arr = card.get('sizes') or []
+                if isinstance(sizes_arr, list):
+                    if wanted_size and wanted_size != single_size:
+                        for sz in sizes_arr:
+                            if not isinstance(sz, dict):
+                                continue
+                            sz_norm = _size_key(sz.get('techSize') or sz.get('wbSize') or card.get('techSize'))
+                            if sz_norm == wanted_size:
+                                chosen_size_obj = sz
+                                break
+                    if chosen_size_obj is None and sizes_arr:
+                        chosen_size_obj = sizes_arr[0]
+                if isinstance(chosen_size_obj, dict):
+                    bcs = chosen_size_obj.get('skus') or chosen_size_obj.get('barcodes') or []
+                    if isinstance(bcs, list) and bcs:
+                        bc_val = str(bcs[0]).strip()
             except Exception:
                 pass
 
         attrs[art] = {
-            'category': (cat_val or '—'),
-            'barcode': (bc_val or '—'),
-            'color': color or '—',
-            'size': (size_val or 'единый'),
-            'composition': composition or '—',
+            'category': cat_val or na,
+            'barcode': bc_val or na,
+            'color': color or na,
+            'size': size_val or single_size,
+            'composition': composition or na,
         }
 
-    return attrs
+    for alias, base in needed_alias_to_base.items():
+        if alias in attrs:
+            continue
+        base_attrs = attrs.get(base)
+        if not base_attrs:
+            continue
+        out = dict(base_attrs)
+        forced_size = needed_alias_size.get(alias)
+        if forced_size:
+            out['size'] = forced_size
+            bc = barcode_by_base_size.get((base, forced_size))
+            if bc:
+                out['barcode'] = bc
+        attrs[alias] = out
 
+    return attrs
 
 def _wb_build_card_indexes(cabinet_id: int, nm_ids: list[int]) -> tuple[dict[int, dict], dict[str, dict]]:
     """Запрашивает WB content-api карточки по nmId и строит индексы для быстрого доступа."""
@@ -1108,15 +1291,68 @@ def _normalize_key_fuzzy(s: str) -> str:
     s = str(s or '')
     s = ''.join(c for c in s if c.isprintable())
     s = s.strip().lower()
-    s = s.replace('ё', 'е')
+    s = s.replace("\u0451", "\u0435")
     s = s.replace('\\', '/')
+    s = re.sub(r"\s+", " ", s)
     s = re.sub(r"\s+", " ", s)
     s = s.replace(" /", "/").replace("/ ", "/")
     s = re.sub(r"/+", "/", s)
     # удаляем знаки препинания, которые часто расходятся между базой/МП
     s = s.replace('.', '')
-    s = s.replace('-', '').replace('–', '').replace('—', '')
+    s = s.replace("-", "").replace("\u2013", "").replace("\u2014", "")
+    s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _split_wb_article_and_size(article: str) -> tuple[str, str]:
+    """Разделить WB-артикул на (базовый артикул, размер)."""
+    s = str(article or '').strip()
+    single_size = normalize_wb_size(None)
+    if not s:
+        return '', single_size
+
+    # Formats:
+    # - "артикул 92-110"
+    # - "артикул/92/110"
+    src = s.replace("\\", "/")
+    m = re.search(r"(\d{2,3})\s*[-/]\s*(\d{2,3})", src)
+    if not m:
+        return s, single_size
+
+    size = f"{m.group(1)}-{m.group(2)}"
+    base = src[:m.start()].strip(" /-")
+    base = base.strip(" /-")
+    return (base or s), size
+
+
+def _normalize_wb_base_for_match(article_base: str) -> str:
+    s = str(article_base or "").strip().lower().replace("\\", "/")
+    s = s.replace("/", " ")
+    s = (
+        s.replace("\u0433\u043e\u043b\u0443\u0431\u0430\u044f", "\u0433\u043e\u043b\u0443\u0431")
+        .replace("\u0433\u043e\u043b\u0443\u0431\u043e\u0439", "\u0433\u043e\u043b\u0443\u0431")
+        .replace("\u0431\u0435\u043b\u0430\u044f", "\u0431\u0435\u043b")
+        .replace("\u0431\u0435\u043b\u044b\u0439", "\u0431\u0435\u043b")
+        .replace("\u0440\u043e\u0437\u043e\u0432\u0430\u044f", "\u0440\u043e\u0437\u043e\u0432")
+        .replace("\u0440\u043e\u0437\u043e\u0432\u044b\u0439", "\u0440\u043e\u0437\u043e\u0432")
+    )
+    s = (
+        s.replace("\u0434\u0435\u0442\u0441\u043a\u0430\u044f", "\u0434\u0435\u0442\u0441\u043a")
+        .replace("\u0434\u0435\u0442\u0441\u043a\u0438\u0439", "\u0434\u0435\u0442\u0441\u043a")
+        .replace("\u0434\u0435\u0442\u0441\u043a\u043e\u0435", "\u0434\u0435\u0442\u0441\u043a")
+    )
+    s = re.sub(r"\s+", " ", s).strip(" /-")
+    return _normalize_key_fuzzy(s)
+
+
+def _canonical_wb_article(article: str) -> str:
+    """Return canonical WB article form: '<base> <size>' or '<base>'."""
+    base, size = _split_wb_article_and_size(article)
+    if not base:
+        return str(article or "").strip()
+    if size and size != normalize_wb_size(None):
+        return f"{base} {size}".strip()
+    return base
 
 
 async def _generate_tz_zip(context: CallbackContext, chat_id: int, selected: set[str], rows: list[dict]) -> tuple[str, str]:
@@ -1225,6 +1461,7 @@ async def _generate_tz_zip(context: CallbackContext, chat_id: int, selected: set
 
         # собрать все связанные real_articles по всем выбранным кабинетам
         items: list[dict] = []
+        added_item_keys: set[tuple[str, str]] = set()
         for cab_key in selected:
             id_to_arts = links_by_cabinet.get(cab_key) or {}
             arts = [str(a).strip() for a in (id_to_arts.get(tid) or []) if str(a).strip()]
@@ -1234,20 +1471,82 @@ async def _generate_tz_zip(context: CallbackContext, chat_id: int, selected: set
             stn = cabinet_stocks_norm.get(cab_key) or {}
             for a in arts:
                 # поиск остатков: exact -> fuzzy(lower/punct)
-                stock_val = st.get(a)
-                if stock_val is None:
-                    stock_val = stn.get(_normalize_key_fuzzy(a), 0)
-                try:
-                    stock_val_i = int(stock_val or 0)
-                except Exception:
-                    stock_val_i = 0
-                lvl = _stocks_level(stock_val_i, thresholds)
-                items.append({
-                    'cabinet_key': cab_key,
-                    'article': a,
-                    'stock': stock_val_i,
-                    'level': lvl,
-                })
+                # Для WB дополнительно учитываем размерные строки вида "артикул + размер".
+                mp, _cid = cab_key.split(":", 1)
+                if mp == "wb":
+                    nk_a = _normalize_key_fuzzy(a)
+                    matches: list[tuple[str, int]] = []
+                    for art_key, stock_val in st.items():
+                        art_key_s = str(art_key).strip()
+                        nk_item = _normalize_key_fuzzy(art_key_s)
+                        if (
+                            art_key_s == a
+                            or art_key_s.startswith(f"{a} ")
+                            or nk_item == nk_a
+                            or nk_item.startswith(nk_a)
+                        ):
+                            try:
+                                stock_val_i = int(stock_val or 0)
+                            except Exception:
+                                stock_val_i = 0
+                            matches.append((art_key_s, stock_val_i))
+
+                # Если для базового артикула есть размерные строки,
+                # оставляем только их и пропускаем базовый дубликат.
+                    size_matches = [x for x in matches if x[0] != a and x[0].startswith(f"{a} ")]
+                    selected_matches = size_matches or matches
+
+                    if selected_matches:
+                        for art_key_s, stock_val_i in selected_matches:
+                            item_key = (cab_key, art_key_s)
+                            if item_key in added_item_keys:
+                                continue
+                            added_item_keys.add(item_key)
+                            lvl = _stocks_level(stock_val_i, thresholds)
+                            items.append({
+                                'cabinet_key': cab_key,
+                                'article': art_key_s,
+                                'stock': stock_val_i,
+                                'level': lvl,
+                            })
+                    else:
+                        stock_val = st.get(a)
+                        if stock_val is None:
+                            stock_val = stn.get(_normalize_key_fuzzy(a), 0)
+                        try:
+                            stock_val_i = int(stock_val or 0)
+                        except Exception:
+                            stock_val_i = 0
+                        item_key = (cab_key, a)
+                        if item_key in added_item_keys:
+                            continue
+                        added_item_keys.add(item_key)
+                        lvl = _stocks_level(stock_val_i, thresholds)
+                        items.append({
+                            'cabinet_key': cab_key,
+                            'article': a,
+                            'stock': stock_val_i,
+                            'level': lvl,
+                        })
+                else:
+                    stock_val = st.get(a)
+                    if stock_val is None:
+                        stock_val = stn.get(_normalize_key_fuzzy(a), 0)
+                    try:
+                        stock_val_i = int(stock_val or 0)
+                    except Exception:
+                        stock_val_i = 0
+                    item_key = (cab_key, a)
+                    if item_key in added_item_keys:
+                        continue
+                    added_item_keys.add(item_key)
+                    lvl = _stocks_level(stock_val_i, thresholds)
+                    items.append({
+                        'cabinet_key': cab_key,
+                        'article': a,
+                        'stock': stock_val_i,
+                        'level': lvl,
+                    })
 
         if not items:
             continue
@@ -1379,6 +1678,42 @@ async def _generate_tz_zip(context: CallbackContext, chat_id: int, selected: set
                 if not v:
                     nk = _normalize_key_fuzzy(k)
                     v = norm_map.get(nk)
+                if not v:
+                    base_k, size_k = _split_wb_article_and_size(k)
+                    canonical_k = f"{base_k} {size_k}" if base_k and size_k != normalize_wb_size(None) else base_k
+                    if canonical_k:
+                        v = attrs.get(canonical_k)
+                        if not v:
+                            v = norm_map.get(_normalize_key_fuzzy(canonical_k))
+                    if not v and size_k != normalize_wb_size(None):
+                        alt_k = f"{base_k} {size_k.replace('-', '/')}"
+                        v = attrs.get(alt_k)
+                        if not v:
+                            v = norm_map.get(_normalize_key_fuzzy(alt_k))
+                    if base_k and base_k != k:
+                        if not v:
+                            v = attrs.get(base_k)
+                        if not v:
+                            v = norm_map.get(_normalize_key_fuzzy(base_k))
+                        if v:
+                            merged = dict(v)
+                            if size_k and size_k != normalize_wb_size(None):
+                                merged['size'] = size_k
+                            v = merged
+                    # Последний запасной вариант: сопоставить по нормализованной базе + размеру
+                    # среди всех ключей attrs.
+                    if not v and base_k:
+                        nk_base = _normalize_wb_base_for_match(base_k)
+                        for ak, av in (attrs or {}).items():
+                            a_base, a_size = _split_wb_article_and_size(str(ak))
+                            if _normalize_wb_base_for_match(a_base) != nk_base:
+                                continue
+                            if size_k == normalize_wb_size(None) or a_size == size_k:
+                                merged = dict(av or {})
+                                if size_k and size_k != normalize_wb_size(None):
+                                    merged['size'] = size_k
+                                v = merged
+                                break
                 if v:
                     out[k] = v
             wb_attrs_by_cabinet[cid] = out
@@ -1418,7 +1753,7 @@ async def _generate_tz_zip(context: CallbackContext, chat_id: int, selected: set
                 attrs_map = ozon_attrs_by_cabinet.get(cid) or {}
                 attrs = attrs_map.get(art)
                 if not attrs:
-                    # fallback: fuzzy
+                    # запасной вариант: нечеткое сопоставление
                     attrs = (ozon_attrs_norm_by_cabinet.get(cid) or {}).get(_normalize_key_fuzzy(art))
                 attrs = attrs or {}
             else:
@@ -1426,6 +1761,61 @@ async def _generate_tz_zip(context: CallbackContext, chat_id: int, selected: set
                 attrs = attrs_map.get(art)
                 if not attrs:
                     attrs = (wb_attrs_norm_by_cabinet.get(cid) or {}).get(_normalize_key_fuzzy(art))
+                base_art, size_from_article = _split_wb_article_and_size(art)
+                if not attrs and base_art:
+                    canonical_art = f"{base_art} {size_from_article}" if size_from_article != normalize_wb_size(None) else base_art
+                    attrs = attrs_map.get(canonical_art)
+                    if not attrs:
+                        attrs = (wb_attrs_norm_by_cabinet.get(cid) or {}).get(_normalize_key_fuzzy(canonical_art))
+                    if not attrs and size_from_article != normalize_wb_size(None):
+                        alt_art = f"{base_art} {size_from_article.replace('-', '/')}"
+                        attrs = attrs_map.get(alt_art)
+                        if not attrs:
+                            attrs = (wb_attrs_norm_by_cabinet.get(cid) or {}).get(_normalize_key_fuzzy(alt_art))
+                if not attrs and base_art:
+                    nk_base = _normalize_wb_base_for_match(base_art)
+                    for ak, av in (attrs_map or {}).items():
+                        a_base, a_size = _split_wb_article_and_size(str(ak))
+                        if _normalize_wb_base_for_match(a_base) != nk_base:
+                            continue
+                        if size_from_article == normalize_wb_size(None) or a_size == size_from_article:
+                            attrs = dict(av or {})
+                            if size_from_article and size_from_article != normalize_wb_size(None):
+                                attrs['size'] = size_from_article
+                            break
+                base_attrs = attrs_map.get(base_art)
+                if not base_attrs:
+                    base_attrs = (wb_attrs_norm_by_cabinet.get(cid) or {}).get(_normalize_key_fuzzy(base_art))
+                if not base_attrs and base_art:
+                    nk_base = _normalize_wb_base_for_match(base_art)
+                    for ak, av in (attrs_map or {}).items():
+                        a_base, _ = _split_wb_article_and_size(str(ak))
+                        if _normalize_wb_base_for_match(a_base) == nk_base:
+                            base_attrs = av
+                            break
+                if base_attrs:
+                    merged = dict(base_attrs)
+                    if attrs:
+                        merged.update(attrs)
+                    attrs = merged
+                    if size_from_article != normalize_wb_size(None):
+                        attrs['size'] = size_from_article
+                        # Проверяем, что баркод тоже взят из той же размерной строки,
+                        # если это возможно.
+                        nk_base = _normalize_wb_base_for_match(base_art)
+                        for ak, av in (attrs_map or {}).items():
+                            a_base, a_size = _split_wb_article_and_size(str(ak))
+                            if _normalize_wb_base_for_match(a_base) != nk_base:
+                                continue
+                            if a_size == size_from_article and isinstance(av, dict):
+                                bc = str(av.get('barcode') or '').strip()
+                                if bc and bc != '—' and bc != '-':
+                                    attrs['barcode'] = bc
+                                if av.get('category'):
+                                    attrs['category'] = av.get('category')
+                                if av.get('composition'):
+                                    attrs['composition'] = av.get('composition')
+                                break
                 attrs = attrs or {}
 
             if not attrs:
@@ -1434,7 +1824,7 @@ async def _generate_tz_zip(context: CallbackContext, chat_id: int, selected: set
             ln['category'] = attrs.get('category', '—') or '—'
             ln['barcode'] = attrs.get('barcode', '—') or '—'
             ln['color'] = attrs.get('color', '—') or '—'
-            ln['size'] = attrs.get('size', 'единый') or 'единый'
+            ln['size'] = attrs.get('size', normalize_wb_size(None)) or normalize_wb_size(None)
             ln['composition'] = attrs.get('composition', '—') or '—'
 
         out_path = os.path.join(tmp_dir, _safe_filename(f"ТЗ ({seller}, {shop}, {today}).xlsx"))

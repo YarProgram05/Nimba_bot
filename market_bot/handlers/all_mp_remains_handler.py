@@ -4,6 +4,7 @@ import os
 import sys
 import shutil
 import logging
+import re
 import pandas as pd
 import time
 import asyncio
@@ -224,7 +225,7 @@ async def fetch_ozon_remains_raw(cabinet_id):
         logger.warning(f"Ozon кабинет {cabinet_id}: не удалось получить дерево категорий: {e}")
 
     # 2) Запрашиваем product attributes (и через них заполним категорию/состав)
-    offer_id_to_category = dict(offer_id_to_category)  # keep existing
+    offer_id_to_category = dict(offer_id_to_category)  # сохраняем уже собранные значения
     offer_id_to_composition: dict[str, str] = {}
 
     # Кеш метаданных атрибутов по (dcid,type_id)
@@ -306,7 +307,7 @@ async def fetch_ozon_remains_raw(cabinet_id):
 
     # Убираем кеши material_* — они больше не нужны для "Состав".
 
-    # NOTE: для "Состав" мы используем строковый атрибут из /v4/product/info/attributes,
+    # Для "Состава" используем строковый атрибут из /v4/product/info/attributes,
     # поэтому справочник значений (/attribute/values) не нужен.
 
     # (метод отсутствует в OzonAPI, поэтому вызываем напрямую)
@@ -510,23 +511,53 @@ async def fetch_ozon_remains_raw(cabinet_id):
 
 
 def normalize_wb_size(value) -> str:
-    """Нормализация размера WB для отчётов.
-
-    Если размер отсутствует/0/ONE — возвращаем "единый".
-    """
+    """Нормализует размер WB в формат `NNN-NNN` или `единый`."""
+    unified = "единый"
     if value is None:
-        return "единый"
+        return unified
     s = str(value).strip()
     if not s:
-        return "единый"
+        return unified
     s_up = s.upper()
     if s_up in {"0", "ONE", "ONE SIZE", "ONESIZE", "ЕДИНЫЙ", "ЕДИНЫЙ РАЗМЕР"}:
-        return "единый"
+        return unified
+    src = s.replace("\\", "/")
+    m = re.search(r"(\d{2,3})\s*[-/]\s*(\d{2,3})", src)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
     return s
+
+
+def drop_unified_rows_if_sized_exists(rows: dict[str, dict]) -> dict[str, dict]:
+    """Удаляет строки с размером `единый`, если у артикула есть размерные строки."""
+    sized_articles: set[str] = set()
+    for item in rows.values():
+        if not isinstance(item, dict):
+            continue
+        art = clean_article(item.get("article"))
+        size = normalize_wb_size(item.get("size"))
+        if art and size and size != "единый":
+            sized_articles.add(art)
+
+    if not sized_articles:
+        return rows
+
+    filtered: dict[str, dict] = {}
+    for key, item in rows.items():
+        if not isinstance(item, dict):
+            filtered[key] = item
+            continue
+        art = clean_article(item.get("article"))
+        size = normalize_wb_size(item.get("size"))
+        if art in sized_articles and (not size or size == "единый"):
+            continue
+        filtered[key] = item
+    return filtered
 
 
 async def fetch_wb_remains_raw(cabinet_id):
     raw_stock_dict: dict[str, dict] = {}
+    row_stock_dict: dict[str, dict] = {}
     raw_data: list[dict] = []
 
     for attempt in range(MAX_RETRIES):
@@ -539,7 +570,8 @@ async def fetch_wb_remains_raw(cabinet_id):
                 f"WB кабинет {cabinet_id}: get_fbo_stocks_v1 строк={len(stocks or [])} за {time.time() - t0:.2f}s"
             )
 
-            # --- FIX: statistics-api может не включать товары с 0 остатками (или вообще не было движений по FBO).
+            # statistics-api может не включать товары с 0 остатками
+            # (или если по FBO вообще не было движений).
             # Подмешиваем список всех карточек продавца из content-api и добавляем отсутствующие supplierArticle как 0.
             all_cards: list[dict] = []
             cards_index: dict[str, dict] = {}
@@ -581,14 +613,18 @@ async def fetch_wb_remains_raw(cabinet_id):
             except Exception as e:
                 logger.warning(f"WB кабинет {cabinet_id}: не удалось подмешать карточки из content-api для 0-остатков: {e}")
 
-            for item in (stocks or []):
+            for idx, item in enumerate(stocks or []):
                 art = clean_article(item.get("supplierArticle"))
                 if not art:
                     continue
 
+                barcode = normalize_barcode(item.get("barcode"))
+                size_value = normalize_wb_size(item.get("techSize"))
+                row_key = f"{art}__{barcode}" if barcode else f"{art}__size_{size_value}"
+
                 category = item.get("subject") or item.get("category") or "—"
 
-                # FIX: если category пустая (часто у 0-остатков), берём из content-карточки по vendorCode
+                # Если category пустая (часто у 0-остатков), берём из content-карточки по vendorCode.
                 if (not str(category).strip()) or str(category).strip() == "—":
                     card = cards_index.get(art)
                     if isinstance(card, dict):
@@ -618,11 +654,80 @@ async def fetch_wb_remains_raw(cabinet_id):
                 raw_stock_dict[art]['in_way_to_client'] += in_way_to_client
                 raw_stock_dict[art]['in_way_from_client'] += in_way_from_client
 
-            for art, data in raw_stock_dict.items():
+                if row_key not in row_stock_dict:
+                    row_stock_dict[row_key] = {
+                        'article': art,
+                        'size': size_value,
+                        'barcode': barcode,
+                        'category': str(category).strip() if str(category).strip() else '—',
+                        'quantity': 0,
+                        'in_way_to_client': 0,
+                        'in_way_from_client': 0
+                    }
+                row_stock_dict[row_key]['quantity'] += quantity
+                row_stock_dict[row_key]['in_way_to_client'] += in_way_to_client
+                row_stock_dict[row_key]['in_way_from_client'] += in_way_from_client
+
+
+            existing_article_size_keys = {
+                f"{d.get('article')}__{d.get('size') or 'единый'}"
+                for d in row_stock_dict.values()
+                if isinstance(d, dict)
+            }
+
+            for art in list(raw_stock_dict.keys()):
+                card = cards_index.get(art)
+                if not isinstance(card, dict):
+                    continue
+
+                sizes = card.get("sizes") or []
+                if not isinstance(sizes, list):
+                    continue
+
+                category_val = raw_stock_dict.get(art, {}).get('category', '—')
+                for sz in sizes:
+                    if not isinstance(sz, dict):
+                        continue
+
+                    size_value = normalize_wb_size(sz.get("techSize") or sz.get("wbSize") or card.get("techSize"))
+                    article_size_key = f"{art}__{size_value}"
+                    if article_size_key in existing_article_size_keys:
+                        continue
+                    barcode = ""
+                    for key in ("skus", "barcodes"):
+                        vals = sz.get(key)
+                        if isinstance(vals, list):
+                            for v in vals:
+                                bc = normalize_barcode(v)
+                                if bc:
+                                    barcode = bc
+                                    break
+                        if barcode:
+                            break
+
+                    row_key = f"{art}__{barcode}" if barcode else f"{art}__size_{size_value}"
+                    if row_key not in row_stock_dict:
+                        row_stock_dict[row_key] = {
+                            'article': art,
+                            'size': size_value,
+                            'barcode': barcode,
+                            'category': category_val,
+                            'quantity': 0,
+                            'in_way_to_client': 0,
+                            'in_way_from_client': 0
+                        }
+                        existing_article_size_keys.add(article_size_key)
+
+            row_stock_dict = drop_unified_rows_if_sized_exists(row_stock_dict)
+
+            for data in row_stock_dict.values():
                 total = data['quantity'] + data['in_way_to_client'] + data['in_way_from_client']
+                art = data.get('article', '')
+                size_value = data.get('size') or 'единый'
+                display_art = art if size_value == 'единый' else f"{art} {size_value}"
                 raw_data.append({
                     'Категория': data.get('category', '—'),
-                    'Артикул': art,
+                    'Артикул': display_art,
                     'Доступно на складах': data['quantity'],
                     'Возвращаются от покупателей': data['in_way_from_client'],
                     'В пути до покупателей': data['in_way_to_client'],
@@ -630,8 +735,11 @@ async def fetch_wb_remains_raw(cabinet_id):
                 })
 
             result_dict = {}
-            for art, data in raw_stock_dict.items():
-                result_dict[art] = {
+            for stock_key, data in row_stock_dict.items():
+                result_dict[stock_key] = {
+                    'article': data['article'],
+                    'size': data.get('size', 'единый'),
+                    'barcode': data['barcode'],
                     'avail': data['quantity'],
                     'return': data['in_way_from_client'],
                     'inway': data['in_way_to_client']
@@ -661,6 +769,37 @@ def normalize_art(art_str):
     s = ''.join(c for c in s if c.isprintable())
     s = s.strip().lower()
     return s
+
+
+def normalize_barcode(value) -> str:
+    if value is None:
+        return ""
+    return ''.join(ch for ch in str(value) if ch.isdigit())
+
+
+def build_wb_reverse(id_to_arts):
+    art_rev = {}
+    barcode_rev = {}
+    for tid, arts in id_to_arts.items():
+        for art in arts:
+            clean_art = normalize_art(art)
+            if clean_art:
+                art_rev[clean_art] = tid
+            clean_barcode = normalize_barcode(art)
+            if clean_barcode:
+                barcode_rev[clean_barcode] = tid
+    return art_rev, barcode_rev
+
+
+def resolve_wb_template_id(stock_key, stock_data, art_rev, barcode_rev):
+    clean_art = normalize_art(stock_data.get('article') or stock_key)
+    tid = art_rev.get(clean_art)
+    if tid is not None:
+        return tid
+    clean_barcode = normalize_barcode(stock_data.get('barcode'))
+    if clean_barcode:
+        return barcode_rev.get(clean_barcode)
+    return None
 
 
 def _get_rows_to_color(df, art_column, cabinet_arts_set):
@@ -813,9 +952,9 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         ozon1_rev = build_reverse(ozon1_id_to_arts)
         ozon2_rev = build_reverse(ozon2_id_to_arts)
         ozon3_rev = build_reverse(ozon3_id_to_arts)
-        wb1_rev = build_reverse(wb1_id_to_arts)
-        wb2_rev = build_reverse(wb2_id_to_arts)
-        wb3_rev = build_reverse(wb3_id_to_arts)
+        wb1_art_rev, wb1_barcode_rev = build_wb_reverse(wb1_id_to_arts)
+        wb2_art_rev, wb2_barcode_rev = build_wb_reverse(wb2_id_to_arts)
+        wb3_art_rev, wb3_barcode_rev = build_wb_reverse(wb3_id_to_arts)
 
         # === 4. Агрегация данных ===
         ozon1_agg = {}
@@ -853,8 +992,7 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
 
         wb1_agg = {}
         for art, data in wb1_raw_dict.items():
-            clean_art = normalize_art(art)
-            tid = wb1_rev.get(clean_art)
+            tid = resolve_wb_template_id(art, data, wb1_art_rev, wb1_barcode_rev)
             if tid is not None:
                 if tid not in wb1_agg:
                     wb1_agg[tid] = {'avail': 0, 'return': 0, 'inway': 0}
@@ -864,8 +1002,7 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
 
         wb2_agg = {}
         for art, data in wb2_raw_dict.items():
-            clean_art = normalize_art(art)
-            tid = wb2_rev.get(clean_art)
+            tid = resolve_wb_template_id(art, data, wb2_art_rev, wb2_barcode_rev)
             if tid is not None:
                 if tid not in wb2_agg:
                     wb2_agg[tid] = {'avail': 0, 'return': 0, 'inway': 0}
@@ -875,8 +1012,7 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
 
         wb3_agg = {}
         for art, data in wb3_raw_dict.items():
-            clean_art = normalize_art(art)
-            tid = wb3_rev.get(clean_art)
+            tid = resolve_wb_template_id(art, data, wb3_art_rev, wb3_barcode_rev)
             if tid is not None:
                 if tid not in wb3_agg:
                     wb3_agg[tid] = {'avail': 0, 'return': 0, 'inway': 0}
@@ -1297,9 +1433,9 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
         ozon1_rev = build_reverse(ozon1_id_to_arts)
         ozon2_rev = build_reverse(ozon2_id_to_arts)
         ozon3_rev = build_reverse(ozon3_id_to_arts)
-        wb1_rev = build_reverse(wb1_id_to_arts)
-        wb2_rev = build_reverse(wb2_id_to_arts)
-        wb3_rev = build_reverse(wb3_id_to_arts)
+        wb1_art_rev, wb1_barcode_rev = build_wb_reverse(wb1_id_to_arts)
+        wb2_art_rev, wb2_barcode_rev = build_wb_reverse(wb2_id_to_arts)
+        wb3_art_rev, wb3_barcode_rev = build_wb_reverse(wb3_id_to_arts)
 
         # === 4. Агрегация данных ===
         ozon1_agg = {}
@@ -1337,8 +1473,7 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
 
         wb1_agg = {}
         for art, data in wb1_raw_dict.items():
-            clean_art = normalize_art(art)
-            tid = wb1_rev.get(clean_art)
+            tid = resolve_wb_template_id(art, data, wb1_art_rev, wb1_barcode_rev)
             if tid is not None:
                 if tid not in wb1_agg:
                     wb1_agg[tid] = {'avail': 0, 'return': 0, 'inway': 0}
@@ -1348,8 +1483,7 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
 
         wb2_agg = {}
         for art, data in wb2_raw_dict.items():
-            clean_art = normalize_art(art)
-            tid = wb2_rev.get(clean_art)
+            tid = resolve_wb_template_id(art, data, wb2_art_rev, wb2_barcode_rev)
             if tid is not None:
                 if tid not in wb2_agg:
                     wb2_agg[tid] = {'avail': 0, 'return': 0, 'inway': 0}
@@ -1359,8 +1493,7 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
 
         wb3_agg = {}
         for art, data in wb3_raw_dict.items():
-            clean_art = normalize_art(art)
-            tid = wb3_rev.get(clean_art)
+            tid = resolve_wb_template_id(art, data, wb3_art_rev, wb3_barcode_rev)
             if tid is not None:
                 if tid not in wb3_agg:
                     wb3_agg[tid] = {'avail': 0, 'return': 0, 'inway': 0}
@@ -1649,7 +1782,7 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
             f"🔹 <b>ВСЕГО на всех маркетплейсах:</b> {fmt(total_all_mp)} шт"
         )
 
-        # === ОТПРАВКА С ДИНАМИЧЕСКИМ CAPTION ===
+        # === ОТПРАВКА С ДИНАМИЧЕСКОЙ ПОДПИСЬЮ ===
         await context.bot.send_document(
             chat_id=chat_id,
             document=open(report_copy, 'rb'),
@@ -1666,4 +1799,3 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
             chat_id=chat_id,
             text=f"❌ Ошибка при генерации {frequency_label.lower()} отчёта по всем маркетплейсам: {str(e)}"
         )
-
