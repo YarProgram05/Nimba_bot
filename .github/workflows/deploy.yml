@@ -15,8 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SERVER_HOST: ${{ secrets.SERVER_HOST || vars.SERVER_HOST }}
-      SERVER_USER: ${{ secrets.SERVER_USER || vars.SERVER_USER }}
+      SERVER_USER: ${{ secrets.SERVER_USER || vars.SERVER_USER || 'root' }}
       SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_PASSPHRASE: ${{ secrets.SSH_PASSPHRASE }}
       SERVER_PORT: ${{ secrets.SERVER_PORT || vars.SERVER_PORT || '22' }}
       APP_ENV_FILE: ${{ secrets.APP_ENV_FILE }}
       REPO_URL: ${{ secrets.REPO_URL || format('https://github.com/{0}.git', github.repository) }}
@@ -29,8 +31,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           missing=()
-          for key in SERVER_HOST SERVER_USER SERVER_PASSWORD APP_ENV_FILE; do
+          for key in SERVER_HOST SERVER_USER APP_ENV_FILE; do
             if [ -z "${!key}" ]; then
               missing+=("$key")
             fi
@@ -39,6 +42,11 @@ jobs:
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "Missing required GitHub Secrets/Vars: ${missing[*]}"
             echo "Configure them in: Settings -> Secrets and variables -> Actions"
+            exit 1
+          fi
+
+          if [ -z "${SERVER_PASSWORD}" ] && [ -z "${SSH_PRIVATE_KEY}" ]; then
+            echo "Configure one auth method: SERVER_PASSWORD or SSH_PRIVATE_KEY"
             exit 1
           fi
 
@@ -54,6 +62,8 @@ jobs:
           host: ${{ env.SERVER_HOST }}
           username: ${{ env.SERVER_USER }}
           password: ${{ env.SERVER_PASSWORD }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          passphrase: ${{ env.SSH_PASSPHRASE }}
           port: ${{ env.SERVER_PORT }}
           envs: APP_ENV_FILE,REPO_URL,BRANCH,APP_DIR,SERVICE_NAME
           script_stop: true
