@@ -1,9 +1,15 @@
-# Ignore everything at repo root by default
+﻿# Ignore everything at repo root by default
 *
 
 # Keep gitignore itself tracked
 !.gitignore
 !README.md
+
+# Keep CI/CD and deploy config tracked
+!.github/
+!.github/**
+!deploy/
+!deploy/**
 
 # Track only the bot subdirectory
 !market_bot/

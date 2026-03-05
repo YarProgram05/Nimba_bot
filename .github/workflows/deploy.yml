@@ -1,0 +1,90 @@
+﻿name: Deploy Bot
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy on server over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          APP_ENV_FILE: ${{ secrets.APP_ENV_FILE }}
+          REPO_URL: ${{ secrets.REPO_URL }}
+          BRANCH: ${{ secrets.DEPLOY_BRANCH }}
+          APP_DIR: ${{ secrets.APP_DIR }}
+          SERVICE_NAME: ${{ secrets.SERVICE_NAME }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: ${{ secrets.SERVER_PORT }}
+          envs: APP_ENV_FILE,REPO_URL,BRANCH,APP_DIR,SERVICE_NAME
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            APP_DIR="${APP_DIR:-/opt/nimba-bot}"
+            BRANCH="${BRANCH:-master}"
+            SERVICE_NAME="${SERVICE_NAME:-nimba-bot}"
+
+            if ! command -v git >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y git
+            fi
+
+            if ! command -v python3 >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y python3 python3-venv python3-pip
+            fi
+
+            if [ ! -d "$APP_DIR/.git" ]; then
+              rm -rf "$APP_DIR"
+              git clone "$REPO_URL" "$APP_DIR"
+            fi
+
+            cd "$APP_DIR"
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+
+            python3 -m venv .venv
+            . .venv/bin/activate
+            pip install --upgrade pip
+            pip install -r market_bot/requirements.txt
+
+            install -d "$APP_DIR/market_bot"
+            printf "%s" "$APP_ENV_FILE" > "$APP_DIR/market_bot/.env"
+            chmod 600 "$APP_DIR/market_bot/.env"
+
+            cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+            [Unit]
+            Description=Nimba Telegram Bot
+            After=network.target
+
+            [Service]
+            Type=simple
+            WorkingDirectory=$APP_DIR/market_bot
+            ExecStart=$APP_DIR/.venv/bin/python main.py
+            Restart=always
+            RestartSec=5
+            User=root
+            Environment=PYTHONUNBUFFERED=1
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable "$SERVICE_NAME"
+            systemctl restart "$SERVICE_NAME"
+            systemctl status "$SERVICE_NAME" --no-pager -l

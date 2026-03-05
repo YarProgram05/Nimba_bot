@@ -1,0 +1,15 @@
+﻿[Unit]
+Description=Nimba Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nimba-bot/market_bot
+ExecStart=/opt/nimba-bot/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+User=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
