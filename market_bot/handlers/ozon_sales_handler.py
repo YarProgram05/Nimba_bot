@@ -87,6 +87,48 @@ def _parse_ozon_op_date(op: dict):
     except Exception:
         return None
 
+
+def _extract_ozon_category(item_info: dict) -> str:
+    for key in ("category", "category_name", "category_id"):
+        value = item_info.get(key)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+    return "—"
+
+
+def _build_type_name_map_from_tree(tree_result: list) -> dict[tuple[int, int], str]:
+    """Строит маппинг (description_category_id, type_id) -> type_name."""
+    result: dict[tuple[int, int], str] = {}
+
+    def _walk(nodes, current_dcid=None):
+        for node in nodes or []:
+            dcid = node.get("description_category_id", current_dcid)
+            tpid = node.get("type_id")
+            tname = node.get("type_name")
+            if dcid is not None and tpid is not None and tname:
+                try:
+                    result[(int(dcid), int(tpid))] = str(tname).strip()
+                except Exception:
+                    pass
+            _walk(node.get("children") or [], dcid)
+
+    _walk(tree_result, None)
+    return result
+
+
+def _resolve_ozon_narrow_category(item_info: dict, type_name_map: dict[tuple[int, int], str]) -> str:
+    """Приоритет: type_name по (description_category_id, type_id), иначе fallback category/category_name."""
+    dcid = item_info.get("description_category_id")
+    tpid = item_info.get("type_id")
+    if dcid is not None and tpid is not None:
+        try:
+            name = type_name_map.get((int(dcid), int(tpid)))
+            if name:
+                return name
+        except Exception:
+            pass
+    return _extract_ozon_category(item_info)
+
 # --- конец helpers ---
 
 # Настройка путей
@@ -106,6 +148,7 @@ from states import OZON_SALES_CABINET_CHOICE, OZON_SALES_DATE_START, OZON_SALES_
 
 # Импорт новой функции из template_loader
 from utils.template_loader import get_cabinet_articles_by_template_id
+from utils.database import get_database
 
 
 def split_by_max_period(start: datetime, end: datetime, max_days: int):
@@ -209,6 +252,78 @@ class OzonAPI:
                 break
             page += 1
         return all_ops
+
+    def get_description_category_tree(self, language: str = "DEFAULT"):
+        payload = {"language": language}
+        return self._post_with_retry("https://api-seller.ozon.ru/v1/description-category/tree", payload)
+
+    def get_product_prices(self, offer_ids=None, product_ids=None, limit: int = 1000, stop_when_found=None):
+        """Возвращает словарь offer_id -> {'marketing_seller_price': float|None}."""
+        def to_float(value):
+            if value is None or value == "":
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        price_by_offer = {}
+        offers = [str(x).strip() for x in (offer_ids or []) if str(x).strip()]
+        products = []
+        for p in (product_ids or []):
+            try:
+                products.append(int(p))
+            except (TypeError, ValueError):
+                continue
+
+        if offers:
+            filter_key = "offer_id"
+            chunks = [offers[i:i + 1000] for i in range(0, len(offers), 1000)]
+        elif products:
+            filter_key = "product_id"
+            chunks = [products[i:i + 1000] for i in range(0, len(products), 1000)]
+        else:
+            filter_key = None
+            chunks = [None]
+
+        target_missing = set(stop_when_found or [])
+
+        stop_all = False
+        for chunk in chunks:
+            cursor = ""
+            while True:
+                payload = {
+                    "cursor": cursor,
+                    "filter": {"visibility": "ALL"},
+                    "limit": max(1, min(int(limit), 1000))
+                }
+                if filter_key and chunk is not None:
+                    payload["filter"][filter_key] = chunk
+
+                data = self._post_with_retry("https://api-seller.ozon.ru/v5/product/info/prices", payload)
+                items = data.get("items", [])
+
+                for item in items:
+                    offer_id = str(item.get("offer_id", "")).strip().lower()
+                    if not offer_id:
+                        continue
+                    price_info = item.get("price") or {}
+                    price_by_offer[offer_id] = {
+                        "marketing_seller_price": to_float(price_info.get("marketing_seller_price")),
+                    }
+
+                if target_missing and target_missing.issubset(set(price_by_offer.keys())):
+                    stop_all = True
+                    break
+
+                cursor = data.get("cursor") or ""
+                if not cursor:
+                    break
+
+            if stop_all:
+                break
+
+        return price_by_offer
 
 
 def parse_date_input(date_str: str) -> datetime:
@@ -388,8 +503,8 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         logger.info(f"[OZON SALES] Ключей заказов для мэтчинга: {len(order_keys)}")
 
-        # === Финансы: расширяем конец периода на +14 дней ===
-        end_dt_ext = end_dt + timedelta(days=14)
+        # === Финансы: расширяем конец периода на +21 дней ===
+        end_dt_ext = end_dt + timedelta(days=21)
         finance_chunks = split_by_calendar_months(start_dt, end_dt_ext)
         all_operations = []
         for i, (chunk_start, chunk_end) in enumerate(finance_chunks, 1):
@@ -418,17 +533,29 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
         # === Обработка FBO ===
         art_data = {}
+        art_key_to_offer_raw = {}
+        art_key_to_product_ids = {}
         for p in all_postings:
             posting_number = p.get("posting_number")
             status = p.get("status")
             for prod in p.get("products", []):
-                offer_id = str(prod.get("offer_id", "")).strip().lower()
-                if not offer_id:
+                offer_id_raw = str(prod.get("offer_id", "")).strip()
+                if not offer_id_raw:
                     continue
+                offer_id = offer_id_raw.lower()
                 qty = prod.get("quantity", 0)
 
                 if offer_id not in art_data:
                     art_data[offer_id] = {"orders": set(), "purchases": 0, "cancels": 0}
+                art_key_to_offer_raw.setdefault(offer_id, offer_id_raw)
+
+                product_id = prod.get("product_id")
+                if product_id is not None:
+                    try:
+                        product_id_int = int(product_id)
+                        art_key_to_product_ids.setdefault(offer_id, set()).add(product_id_int)
+                    except (TypeError, ValueError):
+                        pass
 
                 art_data[offer_id]["orders"].add(posting_number)
                 if status == "delivered":
@@ -542,7 +669,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                 art = f"тип_начисления: {operation_type_name or op.get('type', 'other')}"
                 income[art] = income.get(art, 0) + amount
 
-        # 2) Сервисные начисления — строго в период пользователя (без расширения +14 дней)
+        # 2) Сервисные начисления — строго в период пользователя (без расширения +21 дней)
         service_in_range = 0
         service_out_of_range = 0
         for op in service_ops:
@@ -596,6 +723,20 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                     main_ids_ordered.append(tid)
                     seen.add(tid)
 
+        # Себестоимость из SQLite по template_id
+        id_to_cost = {}
+        try:
+            db = get_database()
+            id_to_cost = db.get_cost_price_by_template_ids(main_ids_ordered)
+            if not id_to_cost:
+                logger.info("[OZON SALES] Себестоимость в SQLite не найдена, запускаю принудительную синхронизацию")
+                if db.sync_from_excel(force=True):
+                    id_to_cost = db.get_cost_price_by_template_ids(main_ids_ordered)
+            logger.info(f"[OZON SALES] Себестоимость из SQLite: {len(id_to_cost)} ID")
+        except Exception as e:
+            logger.warning(f"[OZON SALES] Не удалось загрузить себестоимость из SQLite: {e}")
+            id_to_cost = {}
+
         # Построение art_to_id из template_id_to_cabinet_arts
         art_to_id = {}
         for template_id, cabinet_arts in template_id_to_cabinet_arts.items():
@@ -613,7 +754,10 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                 'orders': 0,
                 'purchases': 0,
                 'cancels': 0,
-                'income': 0
+                'income': 0,
+                'cost_price': id_to_cost.get(group_id),
+                'sum_price_qty': 0,
+                'price_qty': 0
             }
 
         unmatched = {}
@@ -626,7 +770,10 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                     'orders': art_data.get(art, {}).get('orders', 0),
                     'purchases': art_data.get(art, {}).get('purchases', 0),
                     'cancels': art_data.get(art, {}).get('cancels', 0),
-                    'income': income.get(art, 0)
+                    'income': income.get(art, 0),
+                    'cost_price': None,
+                    'sum_price_qty': 0,
+                    'price_qty': 0
                 }
                 continue
 
@@ -642,8 +789,81 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                     'orders': art_data.get(art, {}).get('orders', 0),
                     'purchases': art_data.get(art, {}).get('purchases', 0),
                     'cancels': art_data.get(art, {}).get('cancels', 0),
-                    'income': income.get(art, 0)
+                    'income': income.get(art, 0),
+                    'cost_price': None,
+                    'sum_price_qty': 0,
+                    'price_qty': 0
                 }
+
+        # === Цены товаров (v5/product/info/prices) ===
+        prices_by_offer = {}
+        categories_by_offer = {}
+        try:
+            # === Категории товаров (как в выгрузке остатков) ===
+            type_name_map: dict[tuple[int, int], str] = {}
+            try:
+                tree = ozon.get_description_category_tree(language="DEFAULT")
+                if tree and tree.get("result"):
+                    type_name_map = _build_type_name_map_from_tree(tree.get("result"))
+            except Exception as e:
+                logger.warning(f"[OZON SALES] Не удалось загрузить дерево категорий: {e}")
+
+            offers_for_prices = [art_key_to_offer_raw.get(k, k) for k in art_data.keys()]
+            for chunk in [offers_for_prices[i:i + 1000] for i in range(0, len(offers_for_prices), 1000)]:
+                payload = {"offer_id": chunk}
+                response = requests.post(
+                    "https://api-seller.ozon.ru/v3/product/info/list",
+                    headers=ozon.headers,
+                    json=payload,
+                    timeout=30
+                )
+                if response.status_code != 200:
+                    continue
+                data = response.json() or {}
+                items = []
+                if isinstance(data.get("result"), dict):
+                    items = data.get("result", {}).get("items", []) or []
+                elif isinstance(data.get("items"), list):
+                    items = data.get("items", [])
+                elif isinstance(data.get("result"), list):
+                    items = data.get("result", [])
+
+                for item_info in items:
+                    offer_id_raw = str(item_info.get("offer_id", "")).strip()
+                    if not offer_id_raw:
+                        continue
+                    categories_by_offer[offer_id_raw.lower()] = _resolve_ozon_narrow_category(item_info, type_name_map)
+
+            if offers_for_prices:
+                prices_by_offer = ozon.get_product_prices(offer_ids=offers_for_prices, limit=1000)
+
+            missing_offer_keys = sorted(set(art_data.keys()) - set(prices_by_offer.keys()))
+
+            if missing_offer_keys:
+                missing_product_ids = set()
+                for key in missing_offer_keys:
+                    missing_product_ids.update(art_key_to_product_ids.get(key, set()))
+                if missing_product_ids:
+                    by_product = ozon.get_product_prices(product_ids=list(missing_product_ids), limit=1000)
+                    prices_by_offer.update(by_product)
+
+            missing_offer_keys = sorted(set(art_data.keys()) - set(prices_by_offer.keys()))
+            if missing_offer_keys:
+                fallback = ozon.get_product_prices(
+                    limit=1000,
+                    stop_when_found=set(missing_offer_keys)
+                )
+                for key in missing_offer_keys:
+                    if key in fallback:
+                        prices_by_offer[key] = fallback[key]
+
+            logger.info(
+                f"[OZON SALES] Product prices loaded: requested={len(offers_for_prices)}, "
+                f"got={len(prices_by_offer)}, missing={len(set(art_data.keys()) - set(prices_by_offer.keys()))}"
+            )
+        except Exception as e:
+            logger.warning(f"[OZON SALES] Не удалось загрузить цены товаров: {e}")
+            prices_by_offer = {}
 
         # === Подготовка исходных артикулов для Excel ===
         raw_art_data = []
@@ -659,9 +879,26 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
             total_shipments = purchases + cancels
             purchase_percent_val = (purchases / total_shipments * 100) if total_shipments > 0 else 0
             profit_per_unit = profit / purchases if purchases > 0 else 0
+            group_id = art_to_id.get(art)
+            cost_price = id_to_cost.get(group_id) if group_id is not None else None
+            marketing_seller_price = (prices_by_offer.get(art) or {}).get("marketing_seller_price")
+            margin_per_unit = None
+            margin_percent = None
+            if cost_price is not None:
+                margin_per_unit = profit_per_unit - cost_price
+                if marketing_seller_price is not None and marketing_seller_price != 0:
+                    margin_percent = (margin_per_unit / marketing_seller_price) * 100
+            net_profit = (margin_per_unit * purchases) if margin_per_unit is not None else profit
 
             raw_art_data.append({
+                "category": (categories_by_offer.get(art) or "—"),
                 "art": art,
+                "group_id": group_id,
+                "marketing_seller_price": marketing_seller_price,
+                "cost_price": cost_price,
+                "margin_per_unit": margin_per_unit,
+                "margin_percent": margin_percent,
+                "net_profit": net_profit,
                 "orders": orders,
                 "purchases": purchases,
                 "cancels": cancels,
@@ -670,13 +907,39 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
                 "profit_per_unit": profit_per_unit
             })
 
+            if marketing_seller_price is not None and purchases > 0:
+                if group_id is not None and group_id in grouped:
+                    grouped[group_id]["sum_price_qty"] += marketing_seller_price * purchases
+                    grouped[group_id]["price_qty"] += purchases
+                elif art in unmatched:
+                    unmatched[art]["sum_price_qty"] += marketing_seller_price * purchases
+                    unmatched[art]["price_qty"] += purchases
+
         raw_art_data.sort(key=lambda x: x["purchases"], reverse=True)
+
+        total_cost = sum((item.get("cost_price") or 0) * item.get("purchases", 0) for item in raw_art_data)
+        margin_total = sum(item.get("net_profit") or 0 for item in raw_art_data)
+        total_net_profit = margin_total
+        total_price_qty = sum(
+            (item.get("marketing_seller_price") or 0) * item.get("purchases", 0)
+            for item in raw_art_data
+            if item.get("marketing_seller_price") is not None and item.get("purchases", 0) > 0
+        )
+        total_price_units = sum(
+            item.get("purchases", 0)
+            for item in raw_art_data
+            if item.get("marketing_seller_price") is not None and item.get("purchases", 0) > 0
+        )
+        margin_per_unit_total = (margin_total / total_purchases) if total_purchases > 0 else 0
+        avg_price_total = (total_price_qty / total_price_units) if total_price_units > 0 else 0
+        margin_percent_total = (margin_per_unit_total / avg_price_total * 100) if avg_price_total != 0 else 0
 
         # === Создание Excel ===
         report_path = f"Ozon_Sales_{start_dt.strftime('%d%m%Y')}-{end_dt.strftime('%d%m%Y')}.xlsx"
         create_excel_report(
             grouped, unmatched, id_to_name, main_ids_ordered, report_path,
             total_orders, total_purchases, total_cancels, total_income,
+            total_cost, margin_per_unit_total, margin_percent_total, total_net_profit,
             raw_art_data=raw_art_data
         )
 
@@ -700,8 +963,12 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
             f"✅ <b>Выкупы:</b> {fmt_num(total_purchases)} шт\n"
             f"❌ <b>Отмены:</b> {fmt_num(total_cancels)} шт\n"
             f"💰 <b>Валовая прибыль:</b> {fmt_num(total_income)} ₽\n"
-            f"📈 <b>Прибыль на 1 ед:</b> {fmt_num(avg_profit_per_unit)} ₽\n"
-            f"🔄 <b>Процент выкупов:</b> {purchase_percent:.2f}%"
+            f"📈 <b>Валовая прибыль на 1 ед:</b> {fmt_num(avg_profit_per_unit)} ₽\n"
+            f"🔄 <b>Процент выкупов:</b> {purchase_percent:.2f}%\n" 
+            f"📐 <b>Маржа на 1 ед:</b> {fmt_num(margin_per_unit_total)} ₽\n"
+            f"📊 <b>Маржинальность:</b> {margin_percent_total:.2f}%\n"
+            f"🧾 <b>Чистая прибыль:</b> {fmt_num(total_net_profit)} ₽"
+           
             f"\n\n🏆 <b>Топ-5 артикулов по выкупам:</b>\n"
         )
 
@@ -775,6 +1042,7 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
 
 def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output_path,
                         total_orders, total_purchases, total_cancels, total_income,
+                        total_cost, margin_per_unit_total, margin_percent_total, total_net_profit,
                         raw_art_data=None):
     wb = Workbook()
     ws1 = wb.active
@@ -790,9 +1058,13 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     ws1.append(["Выкупы, шт", total_purchases])
     ws1.append(["Отмены, шт", total_cancels])
     ws1.append(["Валовая прибыль, руб", total_income])
+    ws1.append(["Себестоимость, руб", total_cost])
+    ws1.append(["Маржа на 1 ед, руб", margin_per_unit_total])
+    ws1.append(["Маржинальность, %", f"{margin_percent_total:.2f}%"])
+    ws1.append(["Чистая прибыль", total_net_profit])
 
     avg_profit_per_unit = total_income / total_purchases if total_purchases > 0 else 0
-    ws1.append(["Прибыль на 1 ед, руб", avg_profit_per_unit])
+    ws1.append(["Валовая прибыль на 1 ед, руб", avg_profit_per_unit])
 
     total_shipments = total_purchases + total_cancels
     purchase_percent = (total_purchases / total_shipments * 100) if total_shipments > 0 else 0
@@ -867,8 +1139,12 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         "Наименование",
         "Выкупы, шт",
         "Валовая прибыль, руб",
+        "Себестоимость, руб",
+        "Маржа на 1 ед, руб",
+        "Маржинальность, %",
+        "Чистая прибыль",
         "Процент выкупов",
-        "Прибыль на 1 ед, руб",
+        "Валовая прибыль на 1 ед, руб",
         "Заказы, шт",
         "Отмены, шт"
     ]
@@ -887,22 +1163,38 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         purchases = data.get('purchases', 0)
         cancels = data.get('cancels', 0)
         income_val = data.get('income', 0)
+        cost_price = data.get('cost_price')
+        sum_price_qty = data.get('sum_price_qty', 0)
+        price_qty = data.get('price_qty', 0)
 
         profit_per_unit = income_val / purchases if purchases > 0 else 0
         total_shipments = purchases + cancels
         purchase_percent_val = (purchases / total_shipments * 100) if total_shipments > 0 else 0
+        margin_per_unit = "—"
+        margin_percent = "—"
+        if cost_price is not None:
+            margin_val = profit_per_unit - cost_price
+            margin_per_unit = margin_val
+            avg_price = (sum_price_qty / price_qty) if price_qty > 0 else 0
+            if avg_price != 0:
+                margin_percent = f"{(margin_val / avg_price * 100):.2f}%"
+        net_profit = (margin_val * purchases) if cost_price is not None else income_val
 
         ws2.append([
             name,
             purchases,
             income_val,
+            cost_price if cost_price is not None else "—",
+            margin_per_unit,
+            margin_percent,
+            net_profit,
             f"{purchase_percent_val:.2f}%",
             profit_per_unit,
             orders,
             cancels
         ])
 
-        percent_cell = ws2.cell(row=row_index, column=4)
+        percent_cell = ws2.cell(row=row_index, column=8)
         if purchase_percent_val <= 50:
             percent_cell.fill = red_fill
         elif 50 < purchase_percent_val <= 60:
@@ -932,21 +1224,37 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
         purchases = data.get('purchases', 0)
         cancels = data.get('cancels', 0)
         income_val = data.get('income', 0)
+        cost_price = data.get('cost_price')
+        sum_price_qty = data.get('sum_price_qty', 0)
+        price_qty = data.get('price_qty', 0)
         profit_per_unit = income_val / purchases if purchases > 0 else 0
         total_shipments = purchases + cancels
         purchase_percent_val = (purchases / total_shipments * 100) if total_shipments > 0 else 0
+        margin_per_unit = "—"
+        margin_percent = "—"
+        if cost_price is not None:
+            margin_val = profit_per_unit - cost_price
+            margin_per_unit = margin_val
+            avg_price = (sum_price_qty / price_qty) if price_qty > 0 else 0
+            if avg_price != 0:
+                margin_percent = f"{(margin_val / avg_price * 100):.2f}%"
+        net_profit = (margin_val * purchases) if cost_price is not None else income_val
 
         ws2.append([
             name,
             purchases,
             income_val,
+            cost_price if cost_price is not None else "—",
+            margin_per_unit,
+            margin_percent,
+            net_profit,
             f"{purchase_percent_val:.2f}%",
             profit_per_unit,
             orders,
             cancels
         ])
 
-        percent_cell = ws2.cell(row=row_index, column=4)
+        percent_cell = ws2.cell(row=row_index, column=8)
         if purchase_percent_val <= 50:
             percent_cell.fill = red_fill
         elif 50 < purchase_percent_val <= 60:
@@ -959,6 +1267,10 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
             name,
             0,
             income_val,
+            0,
+            "—",
+            "—",
+            income_val,
             "—",
             0,
             0,
@@ -970,11 +1282,17 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
     if raw_art_data:
         ws3 = wb.create_sheet(title="Исходные артикулы")
         headers3 = [
-            "Артикул (offer_id)",
+            "Категория",
+            "Артикул",
+            "Цена для продавца, руб",
             "Выкупы, шт",
             "Валовая прибыль, руб",
+            "Себестоимость, руб",
+            "Маржа на 1 ед, руб",
+            "Маржинальность, %",
+            "Чистая прибыль",
             "Процент выкупов",
-            "Прибыль на 1 ед, руб",
+            "Валовая прибыль на 1 ед, руб",
             "Заказы, шт",
             "Отмены, шт"
         ]
@@ -984,7 +1302,13 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
 
         row_idx = 2
         for item in raw_art_data:
+            category = item.get("category", "—")
             art = item["art"]
+            marketing_seller_price = item.get("marketing_seller_price")
+            cost_price = item.get("cost_price")
+            margin_per_unit = item.get("margin_per_unit")
+            margin_percent = item.get("margin_percent")
+            net_profit = item.get("net_profit", 0)
             purchases = item["purchases"]
             profit = item["profit"]
             purchase_percent = item["purchase_percent"]
@@ -993,16 +1317,22 @@ def create_excel_report(grouped, unmatched, id_to_name, main_ids_ordered, output
             cancels = item["cancels"]
 
             ws3.append([
+                category,
                 art,
+                marketing_seller_price if marketing_seller_price is not None else "—",
                 purchases,
                 profit,
+                cost_price if cost_price is not None else "—",
+                margin_per_unit if margin_per_unit is not None else "—",
+                f"{margin_percent:.2f}%" if margin_percent is not None else "—",
+                net_profit,
                 f"{purchase_percent:.2f}%",
                 profit_per_unit,
                 orders,
                 cancels
             ])
 
-            percent_cell = ws3.cell(row=row_idx, column=4)
+            percent_cell = ws3.cell(row=row_idx, column=10)
             if purchase_percent <= 50:
                 percent_cell.fill = red_fill
             elif 50 < purchase_percent <= 60:

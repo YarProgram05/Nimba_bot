@@ -53,10 +53,17 @@ class ArticleDatabase:
             CREATE TABLE IF NOT EXISTS articles (
                 id INTEGER NOT NULL,
                 article_name TEXT NOT NULL,
+                cost_price REAL,
                 sheet_name TEXT NOT NULL,
                 PRIMARY KEY (id, sheet_name)
             )
         ''')
+
+        # Миграция для существующих БД: добавляем колонку себестоимости, если её нет.
+        cursor.execute("PRAGMA table_info(articles)")
+        article_cols = {row[1] for row in cursor.fetchall()}
+        if "cost_price" not in article_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN cost_price REAL")
 
         # Таблица для маппинга артикулов кабинетов
         cursor.execute('''
@@ -177,6 +184,35 @@ class ArticleDatabase:
 
             # Читаем все листы из Excel
             xls = pd.ExcelFile(self.excel_path)
+            cost_by_id: Dict[int, float] = {}
+
+            # Загружаем себестоимость один раз из листа (встречается вариант с латинской "C": "Cебестоимость")
+            cost_sheet_name = None
+            for sheet in xls.sheet_names:
+                s_norm = str(sheet).strip().lower().replace("c", "с")
+                if "себестоим" in s_norm:
+                    cost_sheet_name = sheet
+                    break
+
+            if cost_sheet_name:
+                try:
+                    df_cost = pd.read_excel(self.excel_path, sheet_name=cost_sheet_name)
+                    for _, row in df_cost.iterrows():
+                        if pd.isna(row.get('ID')) or pd.isna(row.get('Себестоимость')):
+                            continue
+                        try:
+                            tid = int(row['ID'])
+                            raw_cost = row['Себестоимость']
+                            if isinstance(raw_cost, str):
+                                raw_cost = raw_cost.replace(" ", "").replace(",", ".")
+                            cost_by_id[tid] = float(raw_cost)
+                        except Exception:
+                            continue
+                    logger.info(
+                        f"Загружено себестоимостей из Excel: {len(cost_by_id)} (лист: {cost_sheet_name})"
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось загрузить лист 'Себестоимость': {e}")
 
             for sheet_name in xls.sheet_names:
                 df = pd.read_excel(self.excel_path, sheet_name=sheet_name)
@@ -196,9 +232,9 @@ class ArticleDatabase:
                         all_template_ids.add(article_id)
 
                         cursor.execute('''
-                            INSERT OR REPLACE INTO articles (id, article_name, sheet_name)
-                            VALUES (?, ?, ?)
-                        ''', (article_id, article_name, sheet_name))
+                            INSERT OR REPLACE INTO articles (id, article_name, cost_price, sheet_name)
+                            VALUES (?, ?, ?, ?)
+                        ''', (article_id, article_name, cost_by_id.get(article_id), sheet_name))
                         total_records += 1
 
                 # Затем загружаем маппинги
@@ -221,9 +257,9 @@ class ArticleDatabase:
                             if template_id not in all_template_ids:
                                 all_template_ids.add(template_id)
                                 cursor.execute('''
-                                    INSERT OR REPLACE INTO articles (id, article_name, sheet_name)
-                                    VALUES (?, ?, ?)
-                                ''', (template_id, f"ID {template_id}", sheet_name))
+                                    INSERT OR REPLACE INTO articles (id, article_name, cost_price, sheet_name)
+                                    VALUES (?, ?, ?, ?)
+                                ''', (template_id, f"ID {template_id}", cost_by_id.get(template_id), sheet_name))
                                 total_records += 1
 
                             cursor.execute('''
@@ -326,6 +362,40 @@ class ArticleDatabase:
         )
 
         return template_id_to_name, template_id_to_cabinet_arts
+
+    def get_cost_price_by_template_ids(self, template_ids: List[int] = None) -> Dict[int, float]:
+        """Возвращает маппинг template_id -> себестоимость из SQLite."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        if template_ids:
+            placeholders = ",".join("?" for _ in template_ids)
+            cursor.execute(
+                f'''
+                SELECT id, MAX(cost_price) AS cost_price
+                FROM articles
+                WHERE id IN ({placeholders}) AND cost_price IS NOT NULL
+                GROUP BY id
+                ''',
+                tuple(int(x) for x in template_ids)
+            )
+        else:
+            cursor.execute('''
+                SELECT id, MAX(cost_price) AS cost_price
+                FROM articles
+                WHERE cost_price IS NOT NULL
+                GROUP BY id
+            ''')
+
+        out: Dict[int, float] = {}
+        for tid, cost in cursor.fetchall():
+            try:
+                out[int(tid)] = float(cost)
+            except Exception:
+                continue
+
+        conn.close()
+        return out
 
     def get_sync_info(self) -> dict:
         """
