@@ -34,6 +34,8 @@ from utils.stock_control import resolve_stock_thresholds, apply_fill_to_cells
 
 # Эндпоинты Content API
 WB_CONTENT_BASE_URL = "https://content-api.wildberries.ru"
+WB_API_MAX_RETRIES = 3
+WB_API_RETRY_DELAY = 2
 
 
 def clean_article(article):
@@ -376,7 +378,7 @@ class WildberriesAPI:
             params = {"dateFrom": last_change_date}
 
             try:
-                response = requests.get(url, headers=self.headers, params=params, timeout=10)
+                response = requests.get(url, headers=self.headers, params=params, timeout=30)
                 response.raise_for_status()
                 logger.info(
                     f"Запрос FBO остатков v1: статус={response.status_code}, dateFrom={last_change_date}"
@@ -384,12 +386,14 @@ class WildberriesAPI:
 
                 if response.status_code != 200:
                     logger.error(f"v1 stocks error: {response.status_code} - {response.text}")
-                    break
+                    raise requests.exceptions.RequestException(
+                        f"v1 stocks error: {response.status_code} - {response.text}"
+                    )
 
                 data = response.json()
                 if not isinstance(data, list):
                     logger.error(f"Invalid response (not a list): {data}")
-                    break
+                    raise RuntimeError(f"Invalid response (not a list): {data}")
 
                 if not data:
                     logger.info("Получен пустой ответ, выгрузка завершена")
@@ -405,9 +409,11 @@ class WildberriesAPI:
                 time.sleep(1)
 
             except requests.exceptions.Timeout:
+                raise
                 logger.error(f"Таймаут при запросе FBO остатков (dateFrom={last_change_date})")
                 break
             except requests.exceptions.RequestException as e:
+                raise
                 logger.error(f"Сетевая ошибка при запросе FBO остатков: {e}")
                 break
 

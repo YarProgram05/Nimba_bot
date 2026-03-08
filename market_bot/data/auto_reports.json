@@ -1,12 +1,12 @@
 {
   "726413418": {
     "all_mp_remains": {
-      "enabled": false,
+      "enabled": true,
       "schedule": {
         "type": "interval_days",
         "days": 1,
-        "start_day": 5,
-        "time": "22:20"
+        "start_day": 0,
+        "time": "14:06"
       }
     }
   }

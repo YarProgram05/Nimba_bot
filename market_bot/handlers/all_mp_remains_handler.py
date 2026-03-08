@@ -48,6 +48,36 @@ CACHE_DIR = os.path.join(root_dir, "cache")
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ: СЫРЫЕ ДАННЫЕ ===
 
+def _extract_ozon_info_items(response: dict | None) -> list[dict]:
+    if not isinstance(response, dict):
+        return []
+    if 'result' in response and isinstance(response['result'], dict) and 'items' in response['result']:
+        items = response['result']['items']
+    elif 'items' in response:
+        items = response['items']
+    elif isinstance(response.get('result'), list):
+        items = response['result']
+    else:
+        items = []
+    return items if isinstance(items, list) else []
+
+
+def _extract_ozon_product_list_items(response: dict | None) -> list[dict]:
+    if not isinstance(response, dict):
+        return []
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return []
+    items = result.get("items")
+    return items if isinstance(items, list) else []
+
+
+def _ensure_all_cabinets_loaded(cabinet_results: list[tuple[str, dict, list[dict]]]) -> None:
+    failed = [label for label, raw_dict, raw_data in cabinet_results if not raw_dict and not raw_data]
+    if failed:
+        raise RuntimeError("Не удалось полностью получить остатки по кабинетам: " + ", ".join(failed))
+
+
 async def fetch_ozon_remains_raw(cabinet_id):
     """Полностью копируем логику из handle_cabinet_choice для надежности"""
     ozon = OzonAPI(cabinet_id=cabinet_id)
@@ -61,6 +91,7 @@ async def fetch_ozon_remains_raw(cabinet_id):
     def _ozon_post(path: str, payload: dict, timeout: int = 60) -> dict | None:
         """POST в Ozon Seller API через requests, т.к. не все методы обёрнуты в OzonAPI."""
         import requests
+        attempt = -1
         try:
             resp = requests.post(f"{ozon.base_url}{path}", json=payload, headers=ozon.headers, timeout=timeout)
             if resp.status_code != 200:
@@ -68,6 +99,14 @@ async def fetch_ozon_remains_raw(cabinet_id):
                 return None
             return resp.json() or {}
         except Exception as e:
+            logger.warning(f"WB кабинет {cabinet_id}: попытка {attempt + 1}/{MAX_RETRIES} завершилась неполной выгрузкой: {e}")
+            if False:
+                pass
+                pass
+            logger.warning(f"WB кабинет {cabinet_id}: попытка {attempt + 1}/{MAX_RETRIES} завершилась неполной выгрузкой: {e}")
+            if True:
+                return None
+                pass
             logger.warning(f"Ozon кабинет {cabinet_id}: ошибка запроса {path}: {e}")
             return None
 
@@ -89,22 +128,79 @@ async def fetch_ozon_remains_raw(cabinet_id):
         except Exception:
             return None
 
+    async def _call_with_retries(label: str, func, validator=None):
+        last_error = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                result = func()
+                if validator and not validator(result):
+                    raise RuntimeError(f"{label}: пустой или неполный ответ")
+                return result
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Ozon кабинет {cabinet_id}: {label} не удался (попытка {attempt}/{MAX_RETRIES}): {e}"
+                )
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY * attempt)
+        raise RuntimeError(f"{label}: превышено число попыток") from last_error
+
     # Для диагностики: соберём несколько товаров, у которых категория получилась слишком общей
+    def _ozon_post(path: str, payload: dict, timeout: int = 60) -> dict | None:
+        import requests
+        attempt = -1
+
+        try:
+            resp = requests.post(f"{ozon.base_url}{path}", json=payload, headers=ozon.headers, timeout=timeout)
+            if resp.status_code != 200:
+                logger.warning(f"Ozon кабинет {cabinet_id}: {path} -> {resp.status_code}: {resp.text}")
+                return None
+            return resp.json() or {}
+        except Exception as e:
+            logger.warning(f"Ozon кабинет {cabinet_id}: ошибка запроса {path}: {e}")
+            return None
+
     debug_category_samples: list[dict] = []
     debug_category_samples_limit = 10
 
     # --- Получение данных (точно как в рабочей функции) ---
     t0 = time.time()
-    product_list = ozon.get_product_list(limit=1000)
+    items: list[dict] = []
+    last_id = ""
+    seen_last_ids: set[str] = set()
+    page_count = 0
+    while True:
+        product_list = await _call_with_retries(
+            f"get_product_list page={page_count + 1}",
+            lambda current_last_id=last_id: ozon.get_product_list(limit=1000, last_id=current_last_id),
+            validator=lambda resp: isinstance(resp, dict) and isinstance((resp.get("result") or {}).get("items"), list),
+        )
+        page_items = _extract_ozon_product_list_items(product_list)
+        if not page_items and page_count == 0:
+            logger.warning(f"Ozon РєР°Р±РёРЅРµС‚ {cabinet_id}: С‚РѕРІР°СЂС‹ РЅРµ РЅР°Р№РґРµРЅС‹")
+            return {}, []
+        items.extend(page_items)
+        next_last_id = str((product_list.get("result") or {}).get("last_id") or "").strip()
+        page_count += 1
+        if not next_last_id:
+            break
+        if next_last_id in seen_last_ids:
+            raise RuntimeError(f"Ozon кабинет {cabinet_id}: get_product_list зациклился на last_id={next_last_id}")
+        seen_last_ids.add(next_last_id)
+        last_id = next_last_id
     logger.info(f"Ozon кабинет {cabinet_id}: get_product_list за {time.time() - t0:.2f}s")
     if not product_list:
         logger.warning(f"Ozon кабинет {cabinet_id}: не удалось получить список товаров")
         return {}, []
 
-    items = product_list.get('result', {}).get('items', [])
+    items = items
     if not items:
         logger.warning(f"Ozon кабинет {cabinet_id}: товары не найдены")
         return {}, []
+
+    logger.info(
+        f"Ozon кабинет {cabinet_id}: paginated product list pages={page_count}, rows={len(items)}"
+    )
 
     offer_ids = []
     for item in items:
@@ -142,18 +238,14 @@ async def fetch_ozon_remains_raw(cabinet_id):
     # 1) Получаем sku/name + product_id для последующего запроса attributes
     t0 = time.time()
     for chunk in chunk_list(offer_ids, 1000):
-        product_info_response = ozon.get_product_info_list(offer_ids=chunk)
-        if not product_info_response:
-            continue
+        product_info_response = await _call_with_retries(
+            f"get_product_info_list offers={len(chunk)}",
+            lambda current_chunk=chunk: ozon.get_product_info_list(offer_ids=current_chunk),
+            validator=lambda resp: isinstance(resp, dict),
+        )
 
-        items_in_response = []
-        if 'result' in product_info_response and 'items' in product_info_response['result']:
-            items_in_response = product_info_response['result']['items']
-        elif 'items' in product_info_response:
-            items_in_response = product_info_response['items']
-        elif isinstance(product_info_response.get('result'), list):
-            items_in_response = product_info_response['result']
-        else:
+        items_in_response = _extract_ozon_info_items(product_info_response)
+        if not items_in_response:
             continue
 
         for item_info in items_in_response:
@@ -447,18 +539,14 @@ async def fetch_ozon_remains_raw(cabinet_id):
     missing_offer_ids = list(set(offer_ids) - set(raw_stock_dict.keys()))
     if missing_offer_ids:
         for chunk in chunk_list(missing_offer_ids, 100):
-            info_response = ozon.get_product_info_list(offer_ids=chunk)
-            if not info_response:
-                continue
+            info_response = await _call_with_retries(
+                f"get_product_info_list fallback offers={len(chunk)}",
+                lambda current_chunk=chunk: ozon.get_product_info_list(offer_ids=current_chunk),
+                validator=lambda resp: isinstance(resp, dict),
+            )
 
-            items_in_response = []
-            if 'result' in info_response and 'items' in info_response['result']:
-                items_in_response = info_response['result']['items']
-            elif 'items' in info_response:
-                items_in_response = info_response['items']
-            elif isinstance(info_response.get('result'), list):
-                items_in_response = info_response['result']
-            else:
+            items_in_response = _extract_ozon_info_items(info_response)
+            if not items_in_response:
                 continue
 
             for item in items_in_response:
@@ -484,6 +572,13 @@ async def fetch_ozon_remains_raw(cabinet_id):
                 raw_stock_dict[offer_id]['available'] += available
                 raw_stock_dict[offer_id]['returning'] += returning
                 raw_stock_dict[offer_id]['prepare'] += prepare
+
+    unresolved_offer_ids = set(offer_ids) - set(raw_stock_dict.keys())
+    if unresolved_offer_ids:
+        logger.error(
+            f"Ozon кабинет {cabinet_id}: не удалось получить остатки для {len(unresolved_offer_ids)} товаров"
+        )
+        return {}, []
 
     # === СОЗДАНИЕ АГРЕГИРОВАННЫХ СЫРЫХ ДАННЫХ ===
     raw_data = []
@@ -556,16 +651,17 @@ def drop_unified_rows_if_sized_exists(rows: dict[str, dict]) -> dict[str, dict]:
 
 
 async def fetch_wb_remains_raw(cabinet_id):
-    raw_stock_dict: dict[str, dict] = {}
-    row_stock_dict: dict[str, dict] = {}
-    raw_data: list[dict] = []
-
     for attempt in range(MAX_RETRIES):
         try:
+            raw_stock_dict: dict[str, dict] = {}
+            row_stock_dict: dict[str, dict] = {}
+            raw_data: list[dict] = []
             wb = WildberriesAPI(cabinet_id=cabinet_id)
 
             t0 = time.time()
             stocks = wb.get_fbo_stocks_v1()  # синхронный вызов
+            if stocks is None:
+                raise RuntimeError("get_fbo_stocks_v1 returned None")
             logger.info(
                 f"WB кабинет {cabinet_id}: get_fbo_stocks_v1 строк={len(stocks or [])} за {time.time() - t0:.2f}s"
             )
@@ -576,7 +672,15 @@ async def fetch_wb_remains_raw(cabinet_id):
             all_cards: list[dict] = []
             cards_index: dict[str, dict] = {}
             try:
-                all_cards = wb.get_all_cards(limit=100)
+                for cards_attempt in range(1, MAX_RETRIES + 1):
+                    all_cards = wb.get_all_cards(limit=100)
+                    if all_cards or not stocks:
+                        break
+                    logger.warning(
+                        f"WB кабинет {cabinet_id}: get_all_cards вернул 0 карточек (попытка {cards_attempt}/{MAX_RETRIES})"
+                    )
+                    if cards_attempt < MAX_RETRIES:
+                        await asyncio.sleep(RETRY_DELAY * cards_attempt)
                 all_vendor_codes: set[str] = set()
                 for c in (all_cards or []):
                     vc = (c.get("vendorCode") or c.get("vendorcode") or c.get("vendor_code"))
@@ -612,6 +716,13 @@ async def fetch_wb_remains_raw(cabinet_id):
                             })
             except Exception as e:
                 logger.warning(f"WB кабинет {cabinet_id}: не удалось подмешать карточки из content-api для 0-остатков: {e}")
+
+            expected_articles: set[str] = set(cards_index.keys())
+            if not expected_articles:
+                for stock_item in (stocks or []):
+                    stock_article = clean_article(stock_item.get("supplierArticle"))
+                    if stock_article:
+                        expected_articles.add(stock_article)
 
             for idx, item in enumerate(stocks or []):
                 art = clean_article(item.get("supplierArticle"))
@@ -720,6 +831,14 @@ async def fetch_wb_remains_raw(cabinet_id):
 
             row_stock_dict = drop_unified_rows_if_sized_exists(row_stock_dict)
 
+            missing_articles = expected_articles - set(raw_stock_dict.keys())
+            if missing_articles:
+                raise RuntimeError(
+                    f"после обработки отсутствуют остатки для {len(missing_articles)} артикулов"
+                )
+            if expected_articles and not row_stock_dict:
+                raise RuntimeError("после обработки не сформировано ни одной строки остатков")
+
             for data in row_stock_dict.values():
                 total = data['quantity'] + data['in_way_to_client'] + data['in_way_from_client']
                 art = data.get('article', '')
@@ -751,7 +870,7 @@ async def fetch_wb_remains_raw(cabinet_id):
         except (Timeout, RequestException) as e:
             logger.warning(f"⚠️ Попытка {attempt + 1}/{MAX_RETRIES} не удалась для WB кабинет {cabinet_id}: {e}")
             if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
             else:
                 logger.error(f"❌ Ошибка получения остатков WB кабинет {cabinet_id} после {MAX_RETRIES} попыток")
                 return {}, []
@@ -915,6 +1034,15 @@ async def generate_all_mp_report(update: Update, context: CallbackContext):
         status_msg = await update.message.reply_text("📊 Запрашиваю остатки Wildberries Кабинет 3 (AGNIA)...")
         status_message_ids.append(status_msg.message_id)
         wb3_raw_dict, wb3_raw_data = await fetch_wb_remains_raw(3)
+
+        _ensure_all_cabinets_loaded([
+            ("Ozon 1 (Nimba)", ozon1_raw_dict, ozon1_raw_data),
+            ("Ozon 2 (Galioni)", ozon2_raw_dict, ozon2_raw_data),
+            ("Ozon 3 (AGNIA)", ozon3_raw_dict, ozon3_raw_data),
+            ("WB 1 (Nimba)", wb1_raw_dict, wb1_raw_data),
+            ("WB 2 (Galioni)", wb2_raw_dict, wb2_raw_data),
+            ("WB 3 (AGNIA)", wb3_raw_dict, wb3_raw_data),
+        ])
 
         # === 2. Загружаем маппинги ===
         from utils.template_loader import get_cabinet_articles_by_template_id
@@ -1396,6 +1524,15 @@ async def send_all_mp_remains_automatic(context: CallbackContext):
         wb1_raw_dict, wb1_raw_data = await fetch_wb_remains_raw(1)
         wb2_raw_dict, wb2_raw_data = await fetch_wb_remains_raw(2)
         wb3_raw_dict, wb3_raw_data = await fetch_wb_remains_raw(3)
+
+        _ensure_all_cabinets_loaded([
+            ("Ozon 1 (Nimba)", ozon1_raw_dict, ozon1_raw_data),
+            ("Ozon 2 (Galioni)", ozon2_raw_dict, ozon2_raw_data),
+            ("Ozon 3 (AGNIA)", ozon3_raw_dict, ozon3_raw_data),
+            ("WB 1 (Nimba)", wb1_raw_dict, wb1_raw_data),
+            ("WB 2 (Galioni)", wb2_raw_dict, wb2_raw_data),
+            ("WB 3 (AGNIA)", wb3_raw_dict, wb3_raw_data),
+        ])
 
         # === 2–5. (всё остальное без изменений — копируем твой существующий код) ===
         from utils.template_loader import get_cabinet_articles_by_template_id
