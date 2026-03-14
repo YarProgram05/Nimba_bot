@@ -78,6 +78,96 @@ def _ensure_all_cabinets_loaded(cabinet_results: list[tuple[str, dict, list[dict
         raise RuntimeError("Не удалось полностью получить остатки по кабинетам: " + ", ".join(failed))
 
 
+def _wb_snapshot_dir() -> str:
+    path = os.path.join(CACHE_DIR, "wb_snapshots")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _wb_snapshot_path(cabinet_id: int) -> str:
+    return os.path.join(_wb_snapshot_dir(), f"cabinet_{cabinet_id}.json")
+
+
+def _load_wb_snapshot(cabinet_id: int) -> dict | None:
+    import json
+
+    path = _wb_snapshot_path(cabinet_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        logger.warning(f"WB кабинет {cabinet_id}: не удалось прочитать snapshot остатков: {e}")
+        return None
+
+
+def _save_wb_snapshot(cabinet_id: int, result_dict: dict, raw_data: list[dict], stats: dict) -> None:
+    import json
+
+    payload = {
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "stats": stats,
+        "result_dict": result_dict,
+        "raw_data": raw_data,
+    }
+    try:
+        with open(_wb_snapshot_path(cabinet_id), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"WB кабинет {cabinet_id}: не удалось сохранить snapshot остатков: {e}")
+
+
+def _is_wb_stats_suspicious(
+    stats_article_count: int,
+    row_count: int,
+    total_mp: int,
+    all_cards_count: int,
+    current_articles: set[str],
+    snapshot: dict | None,
+) -> tuple[bool, str]:
+    if all_cards_count > 0 and stats_article_count == 0:
+        return True, "statistics-api вернул 0 артикулов при наличии карточек"
+
+    if all_cards_count > 0 and row_count == 0:
+        return True, "statistics-api вернул 0 строк при наличии карточек"
+
+    if snapshot and isinstance(snapshot.get("stats"), dict):
+        prev_stats = snapshot["stats"]
+        prev_article_count = int(prev_stats.get("stats_article_count") or 0)
+        prev_total_mp = int(prev_stats.get("total_mp") or 0)
+        previous_articles: set[str] = set()
+
+        previous_result_dict = snapshot.get("result_dict")
+        if isinstance(previous_result_dict, dict):
+            for item in previous_result_dict.values():
+                if not isinstance(item, dict):
+                    continue
+                article = clean_article(item.get("article"))
+                if article:
+                    previous_articles.add(article)
+
+        if prev_article_count >= 10 and stats_article_count <= max(1, int(prev_article_count * 0.2)):
+            return True, f"слишком мало артикулов statistics-api: {stats_article_count} против прошлых {prev_article_count}"
+
+        if prev_total_mp > 0 and total_mp == 0 and stats_article_count <= max(1, int(prev_article_count * 0.2)):
+            return True, f"statistics-api вернул нулевой total_mp при прошлом total_mp={prev_total_mp}"
+
+        if previous_articles:
+            missing_previous_articles = previous_articles - current_articles
+            if len(previous_articles) >= 10 and len(missing_previous_articles) >= max(5, int(len(previous_articles) * 0.15)):
+                return True, (
+                    "statistics-api не вернул существенную часть артикулов "
+                    f"из предыдущего snapshot: {len(missing_previous_articles)}/{len(previous_articles)}"
+                )
+
+    if all_cards_count >= 20 and stats_article_count <= max(1, int(all_cards_count * 0.1)):
+        return True, f"слишком мало артикулов statistics-api относительно карточек content-api: {stats_article_count}/{all_cards_count}"
+
+    return False, ""
+
+
 async def fetch_ozon_remains_raw(cabinet_id):
     """Полностью копируем логику из handle_cabinet_choice для надежности"""
     ozon = OzonAPI(cabinet_id=cabinet_id)
@@ -91,7 +181,6 @@ async def fetch_ozon_remains_raw(cabinet_id):
     def _ozon_post(path: str, payload: dict, timeout: int = 60) -> dict | None:
         """POST в Ozon Seller API через requests, т.к. не все методы обёрнуты в OzonAPI."""
         import requests
-        attempt = -1
         try:
             resp = requests.post(f"{ozon.base_url}{path}", json=payload, headers=ozon.headers, timeout=timeout)
             if resp.status_code != 200:
@@ -99,14 +188,6 @@ async def fetch_ozon_remains_raw(cabinet_id):
                 return None
             return resp.json() or {}
         except Exception as e:
-            logger.warning(f"WB кабинет {cabinet_id}: попытка {attempt + 1}/{MAX_RETRIES} завершилась неполной выгрузкой: {e}")
-            if False:
-                pass
-                pass
-            logger.warning(f"WB кабинет {cabinet_id}: попытка {attempt + 1}/{MAX_RETRIES} завершилась неполной выгрузкой: {e}")
-            if True:
-                return None
-                pass
             logger.warning(f"Ozon кабинет {cabinet_id}: ошибка запроса {path}: {e}")
             return None
 
@@ -669,6 +750,18 @@ async def fetch_wb_remains_raw(cabinet_id):
             # statistics-api может не включать товары с 0 остатками
             # (или если по FBO вообще не было движений).
             # Подмешиваем список всех карточек продавца из content-api и добавляем отсутствующие supplierArticle как 0.
+            snapshot = _load_wb_snapshot(cabinet_id)
+            stocks_before_fill = list(stocks or [])
+            current_stats_articles = {
+                art for art in (clean_article(item.get("supplierArticle")) for item in stocks_before_fill) if art
+            }
+            stats_article_count = len(current_stats_articles)
+            stats_total_mp = 0
+            for item in stocks_before_fill:
+                stats_total_mp += int(item.get('quantity', 0) or 0)
+                stats_total_mp += int(item.get('inWayToClient', 0) or 0)
+                stats_total_mp += int(item.get('inWayFromClient', 0) or 0)
+
             all_cards: list[dict] = []
             cards_index: dict[str, dict] = {}
             try:
@@ -716,6 +809,26 @@ async def fetch_wb_remains_raw(cabinet_id):
                             })
             except Exception as e:
                 logger.warning(f"WB кабинет {cabinet_id}: не удалось подмешать карточки из content-api для 0-остатков: {e}")
+
+            all_cards_count = len(cards_index)
+            suspicious_stats, suspicious_reason = _is_wb_stats_suspicious(
+                stats_article_count=stats_article_count,
+                row_count=len(stocks_before_fill),
+                total_mp=stats_total_mp,
+                all_cards_count=all_cards_count,
+                current_articles=current_stats_articles,
+                snapshot=snapshot,
+            )
+            if suspicious_stats:
+                if attempt < MAX_RETRIES - 1:
+                    raise RuntimeError(f"подозрительно неполные WB остатки: {suspicious_reason}")
+                if snapshot and isinstance(snapshot.get("result_dict"), dict) and isinstance(snapshot.get("raw_data"), list):
+                    logger.warning(
+                        f"WB кабинет {cabinet_id}: использую последний корректный snapshot, "
+                        f"потому что текущая выгрузка выглядит неполной: {suspicious_reason}"
+                    )
+                    return snapshot["result_dict"], snapshot["raw_data"]
+                raise RuntimeError(f"WB statistics-api вернул неполные данные: {suspicious_reason}")
 
             expected_articles: set[str] = set(cards_index.keys())
             if not expected_articles:
@@ -865,6 +978,17 @@ async def fetch_wb_remains_raw(cabinet_id):
                 }
 
             logger.info(f"✅ Успешно получены остатки WB кабинет {cabinet_id} (попытка {attempt + 1})")
+            _save_wb_snapshot(
+                cabinet_id,
+                result_dict,
+                raw_data,
+                {
+                    "stats_article_count": stats_article_count,
+                    "row_count": len(stocks_before_fill),
+                    "total_mp": stats_total_mp,
+                    "all_cards_count": all_cards_count,
+                },
+            )
             return result_dict, raw_data
 
         except (Timeout, RequestException) as e:
@@ -875,6 +999,13 @@ async def fetch_wb_remains_raw(cabinet_id):
                 logger.error(f"❌ Ошибка получения остатков WB кабинет {cabinet_id} после {MAX_RETRIES} попыток")
                 return {}, []
         except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                logger.warning(
+                    f"⚠️ Попытка {attempt + 1}/{MAX_RETRIES} завершилась неполной выгрузкой "
+                    f"WB кабинет {cabinet_id}: {e}"
+                )
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                continue
             logger.error(f"❌ Ошибка получения остатков WB кабинет {cabinet_id}: {e}", exc_info=True)
             return {}, []
 

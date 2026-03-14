@@ -409,13 +409,11 @@ class WildberriesAPI:
                 time.sleep(1)
 
             except requests.exceptions.Timeout:
-                raise
                 logger.error(f"Таймаут при запросе FBO остатков (dateFrom={last_change_date})")
-                break
-            except requests.exceptions.RequestException as e:
                 raise
+            except requests.exceptions.RequestException as e:
                 logger.error(f"Сетевая ошибка при запросе FBO остатков: {e}")
-                break
+                raise
 
         # Не фильтруем quantity > 0: ниже используется логика с нулевыми остатками.
         return all_stocks
