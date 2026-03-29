@@ -36,6 +36,7 @@ from utils.stock_control import resolve_stock_thresholds, apply_fill_to_cells
 WB_CONTENT_BASE_URL = "https://content-api.wildberries.ru"
 WB_API_MAX_RETRIES = 3
 WB_API_RETRY_DELAY = 2
+WB_API_RATE_LIMIT_DELAY = 10
 
 
 def clean_article(article):
@@ -376,44 +377,79 @@ class WildberriesAPI:
         while True:
             url = "https://statistics-api.wildberries.ru/api/v1/supplier/stocks"
             params = {"dateFrom": last_change_date}
+            response = None
 
-            try:
-                response = requests.get(url, headers=self.headers, params=params, timeout=30)
-                response.raise_for_status()
-                logger.info(
-                    f"Запрос FBO остатков v1: статус={response.status_code}, dateFrom={last_change_date}"
-                )
+            for request_attempt in range(1, WB_API_MAX_RETRIES + 1):
+                try:
+                    response = requests.get(url, headers=self.headers, params=params, timeout=30)
 
-                if response.status_code != 200:
-                    logger.error(f"v1 stocks error: {response.status_code} - {response.text}")
-                    raise requests.exceptions.RequestException(
-                        f"v1 stocks error: {response.status_code} - {response.text}"
+                    if response.status_code == 429:
+                        retry_after_raw = response.headers.get("Retry-After")
+                        try:
+                            retry_after = int(float(retry_after_raw))
+                        except (TypeError, ValueError):
+                            retry_after = 0
+                        sleep_seconds = max(
+                            WB_API_RATE_LIMIT_DELAY * request_attempt,
+                            retry_after,
+                        )
+                        logger.warning(
+                            "WB statistics-api rate limit for FBO stocks: "
+                            f"attempt={request_attempt}/{WB_API_MAX_RETRIES}, "
+                            f"dateFrom={last_change_date}, sleep={sleep_seconds}s"
+                        )
+                        if request_attempt >= WB_API_MAX_RETRIES:
+                            response.raise_for_status()
+                        time.sleep(sleep_seconds)
+                        continue
+
+                    response.raise_for_status()
+                    logger.info(
+                        f"Запрос FBO остатков v1: статус={response.status_code}, dateFrom={last_change_date}"
                     )
-
-                data = response.json()
-                if not isinstance(data, list):
-                    logger.error(f"Invalid response (not a list): {data}")
-                    raise RuntimeError(f"Invalid response (not a list): {data}")
-
-                if not data:
-                    logger.info("Получен пустой ответ, выгрузка завершена")
                     break
 
-                all_stocks.extend(data)
-                logger.info(f"Получено {len(data)} строк, всего: {len(all_stocks)}")
+                except requests.exceptions.Timeout:
+                    logger.warning(
+                        f"Таймаут при запросе FBO остатков (dateFrom={last_change_date}, "
+                        f"attempt={request_attempt}/{WB_API_MAX_RETRIES})"
+                    )
+                    if request_attempt >= WB_API_MAX_RETRIES:
+                        raise
+                    time.sleep(WB_API_RETRY_DELAY * request_attempt)
+                except requests.exceptions.RequestException as e:
+                    status_code = getattr(response, "status_code", None)
+                    if status_code is not None and status_code >= 500 and request_attempt < WB_API_MAX_RETRIES:
+                        sleep_seconds = WB_API_RETRY_DELAY * request_attempt
+                        logger.warning(
+                            "Повторяю запрос FBO остатков после ошибки statistics-api: "
+                            f"status={status_code}, dateFrom={last_change_date}, sleep={sleep_seconds}s"
+                        )
+                        time.sleep(sleep_seconds)
+                        continue
+                    logger.error(f"Сетевая ошибка при запросе FBO остатков: {e}")
+                    raise
 
-                last_change_date = data[-1].get("lastChangeDate")
-                if not last_change_date:
-                    break
+            if response is None:
+                raise RuntimeError(f"Не удалось получить FBO остатки для dateFrom={last_change_date}")
 
-                time.sleep(1)
+            data = response.json()
+            if not isinstance(data, list):
+                logger.error(f"Invalid response (not a list): {data}")
+                raise RuntimeError(f"Invalid response (not a list): {data}")
 
-            except requests.exceptions.Timeout:
-                logger.error(f"Таймаут при запросе FBO остатков (dateFrom={last_change_date})")
-                raise
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Сетевая ошибка при запросе FBO остатков: {e}")
-                raise
+            if not data:
+                logger.info("Получен пустой ответ, выгрузка завершена")
+                break
+
+            all_stocks.extend(data)
+            logger.info(f"Получено {len(data)} строк, всего: {len(all_stocks)}")
+
+            last_change_date = data[-1].get("lastChangeDate")
+            if not last_change_date:
+                break
+
+            time.sleep(1)
 
         # Не фильтруем quantity > 0: ниже используется логика с нулевыми остатками.
         return all_stocks

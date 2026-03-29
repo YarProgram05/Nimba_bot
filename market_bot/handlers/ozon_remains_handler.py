@@ -106,11 +106,19 @@ class OzonAPI:
         }
 
         try:
-            response = requests.post(url, json=payload, headers=self.headers)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=60)
             if response.status_code != 200:
+                logger.warning(f"Ozon /v1/analytics/stocks -> {response.status_code}: {response.text[:500]}")
                 return []
-            data = response.json()
-            return data.get('items', [])
+            data = response.json() or {}
+            if isinstance(data.get('items'), list):
+                return data.get('items') or []
+            result = data.get("result")
+            if isinstance(result, dict) and isinstance(result.get("items"), list):
+                return result.get("items") or []
+            if isinstance(result, list):
+                return result
+            return []
         except Exception as e:
             logger.error(f"Ошибка при получении аналитики остатков: {e}")
             return []

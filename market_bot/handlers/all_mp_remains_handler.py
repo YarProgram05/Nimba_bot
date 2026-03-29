@@ -156,7 +156,13 @@ def _is_wb_stats_suspicious(
 
         if previous_articles:
             missing_previous_articles = previous_articles - current_articles
-            if len(previous_articles) >= 10 and len(missing_previous_articles) >= max(5, int(len(previous_articles) * 0.15)):
+            stats_article_drop_threshold = max(1, int(prev_article_count * 0.85))
+            if (
+                prev_article_count >= 10
+                and stats_article_count <= stats_article_drop_threshold
+                and len(previous_articles) >= 10
+                and len(missing_previous_articles) >= max(5, int(len(previous_articles) * 0.15))
+            ):
                 return True, (
                     "statistics-api не вернул существенную часть артикулов "
                     f"из предыдущего snapshot: {len(missing_previous_articles)}/{len(previous_articles)}"
@@ -592,8 +598,14 @@ async def fetch_ozon_remains_raw(cabinet_id):
     # === АГРЕГАЦИЯ СЫРЫХ ДАННЫХ ПО АРТИКУЛАМ ===
     raw_stock_dict = {}  # Для агрегации сырых данных
 
+    analytics_items_total = 0
+    analytics_non_empty_chunks = 0
+    analytics_chunks_total = max(1, (len(all_skus) + 99) // 100)
     for sku_chunk in chunk_list(all_skus, 100):
         items = ozon.get_analytics_stocks(sku_chunk)
+        analytics_items_total += len(items or [])
+        if items:
+            analytics_non_empty_chunks += 1
         for item in items:
             offer_id = clean_offer_id(item.get('offer_id'))
             if not offer_id:
@@ -617,8 +629,17 @@ async def fetch_ozon_remains_raw(cabinet_id):
             raw_stock_dict[offer_id]['returning'] += returning
             raw_stock_dict[offer_id]['prepare'] += prepare
 
+    logger.info(
+        f"Ozon кабинет {cabinet_id}: analytics/stocks chunks={analytics_chunks_total}, "
+        f"non_empty_chunks={analytics_non_empty_chunks}, rows={analytics_items_total}"
+    )
+
     missing_offer_ids = list(set(offer_ids) - set(raw_stock_dict.keys()))
     if missing_offer_ids:
+        logger.warning(
+            f"Ozon кабинет {cabinet_id}: analytics/stocks не вернул остатки для "
+            f"{len(missing_offer_ids)} товаров, использую fallback через product_info_list.stocks"
+        )
         for chunk in chunk_list(missing_offer_ids, 100):
             info_response = await _call_with_retries(
                 f"get_product_info_list fallback offers={len(chunk)}",
@@ -683,6 +704,10 @@ async def fetch_ozon_remains_raw(cabinet_id):
             'prep': data['prepare']
         }
 
+    logger.info(
+        f"✅ Успешно получены остатки Ozon кабинет {cabinet_id}: "
+        f"товаров={len(result_dict)}, raw_rows={len(raw_data)}, за {time.time() - t0_total:.2f}s"
+    )
     return result_dict, raw_data
 
 
@@ -733,6 +758,7 @@ def drop_unified_rows_if_sized_exists(rows: dict[str, dict]) -> dict[str, dict]:
 
 async def fetch_wb_remains_raw(cabinet_id):
     for attempt in range(MAX_RETRIES):
+        snapshot = _load_wb_snapshot(cabinet_id)
         try:
             raw_stock_dict: dict[str, dict] = {}
             row_stock_dict: dict[str, dict] = {}
@@ -750,7 +776,6 @@ async def fetch_wb_remains_raw(cabinet_id):
             # statistics-api может не включать товары с 0 остатками
             # (или если по FBO вообще не было движений).
             # Подмешиваем список всех карточек продавца из content-api и добавляем отсутствующие supplierArticle как 0.
-            snapshot = _load_wb_snapshot(cabinet_id)
             stocks_before_fill = list(stocks or [])
             current_stats_articles = {
                 art for art in (clean_article(item.get("supplierArticle")) for item in stocks_before_fill) if art
@@ -996,6 +1021,11 @@ async def fetch_wb_remains_raw(cabinet_id):
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY * (attempt + 1))
             else:
+                if snapshot and isinstance(snapshot.get("result_dict"), dict) and isinstance(snapshot.get("raw_data"), list):
+                    logger.warning(
+                        f"WB кабинет {cabinet_id}: использую последний корректный snapshot после сетевой ошибки: {e}"
+                    )
+                    return snapshot["result_dict"], snapshot["raw_data"]
                 logger.error(f"❌ Ошибка получения остатков WB кабинет {cabinet_id} после {MAX_RETRIES} попыток")
                 return {}, []
         except Exception as e:
