@@ -2,7 +2,7 @@
   "726413418": {
     "stock_thresholds": {
       "red": 15,
-      "yellow": 30
+      "yellow": 500
     }
   }
 }

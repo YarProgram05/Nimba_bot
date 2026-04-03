@@ -151,6 +151,15 @@ from utils.template_loader import get_cabinet_articles_by_template_id
 from utils.database import get_database
 
 
+class OzonAPIError(Exception):
+    def __init__(self, message: str, status_code: int | None = None, response_text: str | None = None,
+                 is_temporary: bool = False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_text = response_text
+        self.is_temporary = is_temporary
+
+
 def split_by_max_period(start: datetime, end: datetime, max_days: int):
     """Разбивает диапазон на чанки не длиннее max_days дней."""
     chunks = []
@@ -249,6 +258,115 @@ class OzonAPI:
                 break
             all_ops.extend(ops)
             if page > 100:
+                break
+            page += 1
+        return all_ops
+
+    @staticmethod
+    def _is_temporary_api_error(status_code: int, response_text: str) -> bool:
+        if status_code in (429, 500, 502, 503, 504):
+            return True
+
+        text = (response_text or "").lower()
+        temporary_markers = [
+            "internal error",
+            "\"code\":13",
+            "\"code\": 13",
+            "timeout",
+            "temporar",
+            "rate limit",
+            "too many requests",
+        ]
+        return any(marker in text for marker in temporary_markers)
+
+    def _post_with_retry(
+        self,
+        url: str,
+        payload: dict,
+        max_retries: int = 3,
+        timeout: int = 30,
+        retry_statuses: set[int] | None = None,
+    ):
+        retry_statuses = retry_statuses or {429, 500, 502, 503, 504}
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, json=payload, headers=self.headers, timeout=timeout)
+                if response.status_code == 200:
+                    return response.json()
+
+                response_text = response.text
+                is_temporary = (
+                    response.status_code in retry_statuses
+                    or self._is_temporary_api_error(response.status_code, response_text)
+                )
+                if is_temporary:
+                    logger.warning(
+                        f"⚠️ Ozon API error {response.status_code} on {url}, attempt {attempt + 1}: "
+                        f"{response_text[:300]}"
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+
+                raise OzonAPIError(
+                    f"API error {response.status_code}: {response_text}",
+                    status_code=response.status_code,
+                    response_text=response_text,
+                    is_temporary=is_temporary,
+                )
+            except requests.exceptions.Timeout:
+                logger.warning(f"⚠️ Timeout on {url}, attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise OzonAPIError(
+                    f"Timeout while calling {url}",
+                    response_text="timeout",
+                    is_temporary=True,
+                )
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"⚠️ Request exception on {url}, attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise OzonAPIError(
+                    f"Request exception while calling {url}: {e}",
+                    response_text=str(e),
+                    is_temporary=True,
+                )
+
+        raise OzonAPIError(
+            f"Failed to call {url} after {max_retries} attempts",
+            is_temporary=True,
+        )
+
+    def get_financial_operations(self, date_from: str, date_to: str, page_size: int = 500):
+        all_ops = []
+        page = 1
+        while True:
+            payload = {
+                "filter": {"date": {"from": date_from, "to": date_to}},
+                "page": page,
+                "page_size": page_size
+            }
+            data = self._post_with_retry(
+                "https://api-seller.ozon.ru/v3/finance/transaction/list",
+                payload,
+                max_retries=4,
+                timeout=60,
+                retry_statuses={429, 500, 502, 503, 504},
+            )
+            ops = data.get("result", {}).get("operations", [])
+            if not ops:
+                break
+            all_ops.extend(ops)
+            if len(ops) < page_size:
+                break
+            if page >= 200:
+                logger.warning(
+                    f"[OZON SALES] Достигнут лимит страниц финансовых операций "
+                    f"для периода {date_from} - {date_to}"
+                )
                 break
             page += 1
         return all_ops
@@ -360,6 +478,79 @@ def split_by_calendar_months(start_dt: datetime, end_dt: datetime):
         current_start = next_month
 
     return chunks
+
+
+def split_period_in_half(start_dt: datetime, end_dt: datetime):
+    """Разбивает диапазон по дням на две части без пересечений."""
+    total_days = (end_dt.date() - start_dt.date()).days + 1
+    if total_days <= 1:
+        return None
+
+    left_days = total_days // 2
+    left_end_date = start_dt.date() + timedelta(days=left_days - 1)
+    right_start_date = left_end_date + timedelta(days=1)
+
+    left = (
+        datetime.combine(start_dt.date(), datetime.min.time()).replace(tzinfo=timezone.utc),
+        datetime.combine(left_end_date, datetime.max.time()).replace(tzinfo=timezone.utc)
+    )
+    right = (
+        datetime.combine(right_start_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+        datetime.combine(end_dt.date(), datetime.max.time()).replace(tzinfo=timezone.utc)
+    )
+    return left, right
+
+
+async def fetch_financial_operations_resilient(
+    ozon: OzonAPI,
+    start_dt: datetime,
+    end_dt: datetime,
+    *,
+    max_split_depth: int = 5,
+):
+    pending_periods = [(start_dt, end_dt, 0)]
+    collected_operations = []
+    failed_periods = []
+
+    while pending_periods:
+        current_start, current_end, depth = pending_periods.pop(0)
+        start_iso = current_start.strftime("%Y-%m-%dT00:00:00.000Z")
+        end_iso = current_end.strftime("%Y-%m-%dT23:59:59.999Z")
+
+        try:
+            ops = ozon.get_financial_operations(start_iso, end_iso)
+            collected_operations.extend(ops)
+            await asyncio.sleep(0.1)
+            continue
+        except OzonAPIError as e:
+            can_split = current_start.date() < current_end.date() and depth < max_split_depth
+            if e.is_temporary and can_split:
+                parts = split_period_in_half(current_start, current_end)
+                if parts:
+                    left, right = parts
+                    logger.warning(
+                        f"[OZON SALES] Делю проблемный финансовый период "
+                        f"{current_start.date()} - {current_end.date()} на "
+                        f"{left[0].date()} - {left[1].date()} и {right[0].date()} - {right[1].date()} "
+                        f"(depth={depth + 1})"
+                    )
+                    pending_periods.insert(0, right + (depth + 1,))
+                    pending_periods.insert(0, left + (depth + 1,))
+                    await asyncio.sleep(0.2)
+                    continue
+
+            if e.is_temporary:
+                logger.error(
+                    f"[OZON SALES] Пропускаю финансовый период {current_start.date()} - "
+                    f"{current_end.date()} после исчерпания ретраев: {e}"
+                )
+                failed_periods.append((current_start, current_end, str(e)))
+                await asyncio.sleep(0.1)
+                continue
+
+            raise
+
+    return collected_operations, failed_periods
 
 
 async def start_ozon_sales(update: Update, context: CallbackContext) -> int:
@@ -507,6 +698,22 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         end_dt_ext = end_dt + timedelta(days=21)
         finance_chunks = split_by_calendar_months(start_dt, end_dt_ext)
         all_operations = []
+        failed_finance_periods = []
+        finance_chunks_legacy = finance_chunks
+        for i, (chunk_start, chunk_end) in enumerate(finance_chunks_legacy, 1):
+            logger.info(
+                f"[OZON SALES] Finance request {i}/{len(finance_chunks_legacy)}: "
+                f"{chunk_start.date()} - {chunk_end.date()}"
+            )
+            ops, failed_periods = await fetch_financial_operations_resilient(
+                ozon,
+                chunk_start,
+                chunk_end,
+            )
+            all_operations.extend(ops)
+            failed_finance_periods.extend(failed_periods)
+
+        finance_chunks = []
         for i, (chunk_start, chunk_end) in enumerate(finance_chunks, 1):
             logger.info(f"Запрос финансов {i}/{len(finance_chunks)}: {chunk_start.date()} – {chunk_end.date()}")
             start_iso = chunk_start.strftime("%Y-%m-%dT00:00:00.000Z")
@@ -530,6 +737,11 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
             await asyncio.sleep(0.1)
 
         logger.info(f"Данные загружены за {time.time() - start_time:.1f} сек")
+        if failed_finance_periods:
+            logger.warning(
+                f"[OZON SALES] Финансовые периоды, пропущенные из-за ошибок API: "
+                f"{len(failed_finance_periods)}"
+            )
 
         # === Обработка FBO ===
         art_data = {}
@@ -954,11 +1166,25 @@ async def handle_sales_date_end(update: Update, context: CallbackContext) -> int
         total_shipments = total_purchases + total_cancels
         purchase_percent = (total_purchases / total_shipments * 100) if total_shipments > 0 else 0
         avg_profit_per_unit = total_income / total_purchases if total_purchases > 0 else 0
+        failed_periods_preview = ", ".join(
+            f"{period_start.strftime('%d.%m')}-{period_end.strftime('%d.%m')}"
+            for period_start, period_end, _ in failed_finance_periods[:5]
+        )
+        finance_warning_text = ""
+        if failed_finance_periods:
+            finance_warning_text = (
+                f"⚠️ <b>Часть финансовых периодов Ozon не загрузилась:</b> "
+                f"{failed_periods_preview}"
+            )
+            if len(failed_finance_periods) > 5:
+                finance_warning_text += f" и ещё {len(failed_finance_periods) - 5}"
+            finance_warning_text += "\n\n"
 
         text_summary = (
             f"📊 <b>Сводка по продажам Ozon</b>\n"
             f"Кабинет: <b>Озон {cabinet_id}</b>\n"
             f"Период: <b>{start_str} – {end_str}</b>\n\n"
+            f"{finance_warning_text}"
             f"📦 <b>Заказы:</b> {fmt_num(total_orders)} шт\n"
             f"✅ <b>Выкупы:</b> {fmt_num(total_purchases)} шт\n"
             f"❌ <b>Отмены:</b> {fmt_num(total_cancels)} шт\n"
